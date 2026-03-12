@@ -85,8 +85,13 @@ def _save_attachments_for_message(message, attach_list=None):
         attachment.SaveAsFile(os.path.join(task_folder, file_name))
 
 
-def save_attachments():
-    inbox = outlook_old.GetDefaultFolder(6)
+def save_attachments(outlook):
+    """받은 편지함의 위임 메일 첨부파일을 저장합니다.
+
+    Args:
+        outlook: Outlook MAPI 네임스페이스 인스턴스 (개선 #8: 전역 변수 대신 인자로 전달)
+    """
+    inbox = outlook.GetDefaultFolder(6)
     messages = inbox.Items
     attach_list = []
 
@@ -101,12 +106,15 @@ def save_attachments():
     return attach_list
 
 
-class Handler_Class(object):
+# 개선 #6: Python 3에서 (object) 상속 명시는 불필요
+class Handler_Class:
+    # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
+    outlook = None
 
     def OnNewMailEx(self, receivedItemsIDs):
         # receivedItemsIDs는 ","로 구분된 메일 ID 모음입니다.
         for ID in receivedItemsIDs.split(","):
-            message = outlook_new.Session.GetItemFromID(ID)
+            message = Handler_Class.outlook.Session.GetItemFromID(ID)
 
             if (
                 (message.SenderName == "DoNotReply")
@@ -124,7 +132,7 @@ class Handler_Class(object):
             if (
                 (message.SenderName in ["DoNotReply", "Yong-Sok SHIN [신용석]"])
                 and ("위임" in message.Subject)
-                and (name in ["김지원", "한송희"])
+                and (name in ["이여름", "한송희"])
             ):
                 if "거절결정서" in message.Subject:
                     rejection_type = "FR"
@@ -135,7 +143,7 @@ class Handler_Class(object):
 
     def add_calendar_event(self, message, rejection_type):
         # Outlook의 Calendar에 접근
-        calendar = outlook_new.GetNamespace("MAPI").GetDefaultFolder(
+        calendar = Handler_Class.outlook.GetNamespace("MAPI").GetDefaultFolder(
             9
         )  # 9은 Calendar 폴더
 
@@ -165,22 +173,24 @@ class Handler_Class(object):
 
         if match:
             target_date_str = match.group(1)
-            target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+            # datetime.strptime은 datetime 객체를 반환하므로 .date()로 변환
+            target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
 
             utc_timezone = pytz.utc
             target_date_with_time = datetime.combine(target_date, time(0, 0, 0))
             target_date_utc = utc_timezone.localize(target_date_with_time)
             appointment.Start = target_date_utc
 
-            two_months_later = target_date + relativedelta(months=2)
-            three_months_later = target_date + relativedelta(months=3)
+            four_months_later = target_date + relativedelta(months=4)
 
             if rejection_type == "OA":
                 appointment2.Subject = f"{ref_num}_의견서"
-                response_date = two_months_later - timedelta(days=11)
+                response_date = four_months_later - timedelta(days=11)
             else:
                 appointment2.Subject = f"{ref_num}_재심사"
-                response_date = three_months_later - timedelta(days=10)
+                # 이메일 수신 날짜(CreationTime) 기준 3개월 후로 설정
+                receipt_date = message.CreationTime.date()
+                response_date = receipt_date + relativedelta(months=3)
 
             response_date_with_time = datetime.combine(response_date, time(0, 0, 0))
             response_date_utc = utc_timezone.localize(response_date_with_time)
@@ -189,8 +199,13 @@ class Handler_Class(object):
         else:
             # 날짜를 찾지 못한 경우 이메일 생성 시간으로 대체
             appointment.Start = message.CreationTime
-            appointment2.Start = message.CreationTime  # appointment2도 Start 설정
-            appointment2.Subject = f"{ref_num}_일정"
+            appointment2.Start = message.CreationTime
+
+            # 개선 #5: else 브랜치에서도 rejection_type에 따라 제목 구분
+            if rejection_type == "OA":
+                appointment2.Subject = f"{ref_num}_의견서"
+            else:
+                appointment2.Subject = f"{ref_num}_재심사"
 
         appointment.AllDayEvent = True
         appointment.Body = f"Task details: {message.Body}"
@@ -204,8 +219,11 @@ class Handler_Class(object):
         messageBox = qtw.QMessageBox()
         messageBox.setWindowTitle("Schedule Creation Complete")
         if target_date and response_date:
+            # 개선 #4: datetime 객체를 날짜 문자열로 포맷
+            target_str = target_date.strftime("%Y-%m-%d")
+            response_str = response_date.strftime("%Y-%m-%d")
             messageBox.setText(
-                f"{target_date}: {ref_num}\n{response_date}: {ref_num}\nSchedule Creation Complete"
+                f"{target_str}: {ref_num}\n{response_str}: {ref_num}\nSchedule Creation Complete"
             )
         else:
             messageBox.setText(f"{ref_num}\nSchedule Creation Complete (날짜 미지정)")
@@ -224,9 +242,8 @@ class MainWin(qtw.QWidget):
         notice.setTitle("Messages")
         notice_layout = qtw.QVBoxLayout()
 
-        all_string = ""
-        for attach in self.attach_list:  # self.attach_list 사용 (버그 수정)
-            all_string += attach + "\n"
+        # 개선 #7: += 반복 대신 str.join() 사용
+        all_string = "\n".join(self.attach_list)
 
         label = qtw.QLabel(all_string)
         notice_layout.addWidget(label)
@@ -252,7 +269,8 @@ class MainWin(qtw.QWidget):
         self.resize(400, 200)
         self.show()
 
-        tray_icon = qtw.QSystemTrayIcon(qtg.QIcon("icon.png"), self)
+        # 개선 #1: self.tray_icon으로 저장해 가비지 컬렉션 방지
+        self.tray_icon = qtw.QSystemTrayIcon(qtg.QIcon("icon.png"), self)
         menu = qtw.QMenu()
 
         action1 = menu.addAction("Show")
@@ -260,8 +278,8 @@ class MainWin(qtw.QWidget):
         action2 = menu.addAction("Quit")
         action2.triggered.connect(lambda: sys.exit())
 
-        tray_icon.setContextMenu(menu)
-        tray_icon.show()
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.show()
 
     def closeEvent(self, event):
         event.ignore()
@@ -280,16 +298,21 @@ class MainWin(qtw.QWidget):
         for date_folder in os.listdir(parent_path):
             folder_path = os.path.join(parent_path, date_folder)
 
+            # 개선 #3: 파일이 섞여 있을 경우를 대비해 폴더 여부 확인
+            if not os.path.isdir(folder_path):
+                continue
+
             ref_info = None
             person_info = None
 
             for case_folder in os.listdir(folder_path):
                 try:
-                    time_info, ref_info, person_info = case_folder.split("_")
+                    # 개선 #2: split("_", 2)로 이름에 _ 포함된 경우도 안전하게 처리
+                    time_info, ref_info, person_info = case_folder.split("_", 2)
                     target_folder_name = (
                         f"{ref_info}\\{date_folder}_{time_info}_{person_info}"
                     )
-                except ValueError:  # bare except 대신 ValueError 명시
+                except ValueError:
                     target_folder_name = f"{case_folder}"
 
                 create_dir_if_not_exists(os.path.join(target_path, target_folder_name))
@@ -324,11 +347,14 @@ class MainWin(qtw.QWidget):
 
 
 if __name__ == "__main__":
-    outlook_old = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    # 개선 #8: outlook 인스턴스를 함수/클래스에 명시적으로 전달
+    outlook_mapi = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
     outlook_new = win32com.client.DispatchWithEvents(
         "Outlook.Application", Handler_Class
     )
-    attach_list = save_attachments()
+    Handler_Class.outlook = outlook_new  # 클래스 변수로 주입
+
+    attach_list = save_attachments(outlook_mapi)
     app = qtw.QApplication(sys.argv)
     mw = MainWin(attach_list)
     sys.exit(app.exec())
