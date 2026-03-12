@@ -20,6 +20,17 @@ parent_path = r"C:\Dropbox\1_Projects\Tasks"
 target_path = r"C:\Dropbox\4_Archives\04_Work\02_Review"
 
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
 def create_dir_if_not_exists(directory):
     """디렉토리가 없으면 생성합니다.
     반환값: 이미 존재하면 True, 새로 생성하면 False.
@@ -264,7 +275,7 @@ class MainWin(qtw.QWidget):
 
         self.setLayout(win_layout)
         self.setWindowTitle("Task Manager")
-        self.setWindowIcon(qtg.QIcon("icon.png"))
+        self.setWindowIcon(qtg.QIcon(resource_path("icon.png")))
         self.resize(400, 300)
 
         # UI 개선 #2: 하드코딩된 move(300,300) 대신 화면 중앙에 배치
@@ -275,7 +286,7 @@ class MainWin(qtw.QWidget):
         )
 
         # UI 개선 #4: 트레이 아이콘 더블클릭으로 창 표시
-        self.tray_icon = qtw.QSystemTrayIcon(qtg.QIcon("icon.png"), self)
+        self.tray_icon = qtw.QSystemTrayIcon(qtg.QIcon(resource_path("icon.png")), self)
         menu = qtw.QMenu()
 
         action1 = menu.addAction("Show")
