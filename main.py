@@ -349,38 +349,49 @@ class MainWin(qtw.QWidget):
             if not os.path.isdir(folder_path):
                 continue
 
-            ref_info = None
-            person_info = None
-
             for case_folder in os.listdir(folder_path):
+                origin_path = os.path.join(folder_path, case_folder)
+
+                # 수정 #1: case_folder가 파일이면 건너뜀 (NotADirectoryError 방지)
+                if not os.path.isdir(origin_path):
+                    continue
+
                 try:
                     # 개선 #2: split("_", 2)로 이름에 _ 포함된 경우도 안전하게 처리
                     time_info, ref_info, person_info = case_folder.split("_", 2)
                     target_folder_name = (
                         f"{ref_info}\\{date_folder}_{time_info}_{person_info}"
                     )
+                    label = f"{ref_info}_{person_info}"
                 except ValueError:
                     target_folder_name = f"{case_folder}"
+                    label = case_folder
 
                 create_dir_if_not_exists(os.path.join(target_path, target_folder_name))
 
-                origin_path = os.path.join(folder_path, case_folder)
-
+                failed = False
                 for file_name in os.listdir(origin_path):
                     file_path = os.path.join(origin_path, file_name)
-                    os.rename(
-                        file_path,
-                        os.path.join(target_path, target_folder_name, file_name),
-                    )
+                    # 수정 #2: os.rename() 예외 처리 — 권한 오류·동일 파일명 충돌 대응
+                    try:
+                        os.rename(
+                            file_path,
+                            os.path.join(target_path, target_folder_name, file_name),
+                        )
+                    except OSError as e:
+                        print(f"파일 이동 실패 ({file_name}): {e}")
+                        failed = True
 
-                os.rmdir(origin_path)
+                if not failed:
+                    os.rmdir(origin_path)
+                    # 수정 #3: 완료 메시지를 case_folder 단위로 기록 (마지막 건만 표시되던 버그 수정)
+                    completion_messages += f"{label} 이전 작업 완료\n"
+                else:
+                    completion_messages += f"{label} 이전 실패 (일부 파일 이동 오류)\n"
 
-            os.rmdir(folder_path)
-
-            if ref_info and person_info:
-                completion_messages += f"{ref_info}_{person_info} 이전 작업 완료\n"
-            else:
-                completion_messages += f"{date_folder} 이전 작업 완료\n"
+            # 비어있으면 날짜 폴더도 삭제
+            if not os.listdir(folder_path):
+                os.rmdir(folder_path)
 
         self.update_list(completion_messages.strip().splitlines())
 
