@@ -326,7 +326,7 @@ class MainWin(qtw.QWidget):
         completion_messages = ""
 
         if not os.listdir(parent_path):
-            self.label.setText("이전할 파일이 없습니다.")
+            self.update_list(["이전할 파일이 없습니다."])
             return
 
         for date_folder in os.listdir(parent_path):
