@@ -93,7 +93,13 @@ def _save_attachments_for_message(message, attach_list=None):
 
     for attachment in message.Attachments:
         file_name = "SYS_" + attachment.FileName
-        attachment.SaveAsFile(os.path.join(task_folder, file_name))
+        # 수정 #3: 저장 실패 시 예외를 잡아 나머지 첨부파일 저장 계속 진행
+        try:
+            attachment.SaveAsFile(os.path.join(task_folder, file_name))
+        except Exception as e:
+            print(f"첨부파일 저장 실패 ({file_name}): {e}")
+            if attach_list is not None:
+                attach_list.append(f"{file_name}: 저장 실패")
 
 
 def save_attachments(outlook):
@@ -103,7 +109,8 @@ def save_attachments(outlook):
         outlook: Outlook MAPI 네임스페이스 인스턴스 (개선 #8: 전역 변수 대신 인자로 전달)
     """
     inbox = outlook.GetDefaultFolder(6)
-    messages = inbox.Items
+    # 수정 #2: list()로 스냅샷을 찍어 순회 중 Items 변경으로 인한 누락/중복 방지
+    messages = list(inbox.Items)
     attach_list = []
 
     for message in messages:
@@ -121,6 +128,7 @@ def save_attachments(outlook):
 class Handler_Class:
     # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
     outlook = None
+    main_win = None  # UI 업데이트를 위한 MainWin 인스턴스 참조
 
     def OnNewMailEx(self, receivedItemsIDs):
         # receivedItemsIDs는 ","로 구분된 메일 ID 모음입니다.
@@ -132,7 +140,12 @@ class Handler_Class:
                 and ("위임" in message.Subject)
                 and (message.Attachments.Count != 0)
             ):
-                _save_attachments_for_message(message)
+                # 수정 #1: attach_list를 넘겨 저장 결과를 받고 QListWidget에 항목 추가
+                new_items = []
+                _save_attachments_for_message(message, new_items)
+                if Handler_Class.main_win is not None and new_items:
+                    for item in new_items:
+                        Handler_Class.main_win.list_widget.addItem(item)
 
             # 이름 추출 - 조건 체크 전 실패 가능성 처리
             names = name_key.findall(message.Subject)
@@ -392,4 +405,5 @@ if __name__ == "__main__":
     attach_list = save_attachments(outlook_mapi)
     app = qtw.QApplication(sys.argv)
     mw = MainWin(attach_list)
+    Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     sys.exit(app.exec())
