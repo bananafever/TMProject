@@ -216,7 +216,9 @@ class Handler_Class:
         appointment.Save()
         appointment2.Save()
 
-        messageBox = qtw.QMessageBox()
+        # UI 개선 #5: 활성 창을 부모로 지정 (Handler_Class에서 MainWin 직접 접근 불가)
+        parent_win = qtw.QApplication.activeWindow()
+        messageBox = qtw.QMessageBox(parent_win)
         messageBox.setWindowTitle("Schedule Creation Complete")
         if target_date and response_date:
             # 개선 #4: datetime 객체를 날짜 문자열로 포맷
@@ -242,11 +244,11 @@ class MainWin(qtw.QWidget):
         notice.setTitle("Messages")
         notice_layout = qtw.QVBoxLayout()
 
-        # 개선 #7: += 반복 대신 str.join() 사용
-        all_string = "\n".join(self.attach_list)
-
-        label = qtw.QLabel(all_string)
-        notice_layout.addWidget(label)
+        # UI 개선 #1: QLabel 대신 QListWidget 사용 (스크롤 가능, 메시지 많아도 잘리지 않음)
+        self.list_widget = qtw.QListWidget()
+        for attach in self.attach_list:
+            self.list_widget.addItem(attach)
+        notice_layout.addWidget(self.list_widget)
         notice.setLayout(notice_layout)
 
         transfer_btn = qtw.QPushButton("File Transfer")
@@ -260,16 +262,19 @@ class MainWin(qtw.QWidget):
         transfer_btn.clicked.connect(self.transfer_clicked)
         quit_btn.clicked.connect(self.quit_clicked)
 
-        self.label = label
-
         self.setLayout(win_layout)
         self.setWindowTitle("Task Manager")
         self.setWindowIcon(qtg.QIcon("icon.png"))
-        self.move(300, 300)
-        self.resize(400, 200)
-        self.show()
+        self.resize(400, 300)
 
-        # 개선 #1: self.tray_icon으로 저장해 가비지 컬렉션 방지
+        # UI 개선 #2: 하드코딩된 move(300,300) 대신 화면 중앙에 배치
+        screen_geometry = qtw.QApplication.primaryScreen().availableGeometry()
+        self.move(
+            screen_geometry.center().x() - self.width() // 2,
+            screen_geometry.center().y() - self.height() // 2,
+        )
+
+        # UI 개선 #4: 트레이 아이콘 더블클릭으로 창 표시
         self.tray_icon = qtw.QSystemTrayIcon(qtg.QIcon("icon.png"), self)
         menu = qtw.QMenu()
 
@@ -279,7 +284,23 @@ class MainWin(qtw.QWidget):
         action2.triggered.connect(lambda: sys.exit())
 
         self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
+
+        # UI 개선 #6: 레이아웃과 트레이 설정이 모두 끝난 후 show() 호출
+        self.show()
+
+    def _on_tray_activated(self, reason):
+        """트레이 아이콘 더블클릭 시 창을 표시합니다."""
+        if reason == qtw.QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show()
+            self.activateWindow()
+
+    def update_list(self, messages):
+        """메시지 목록을 갱신합니다."""
+        self.list_widget.clear()
+        for msg in messages:
+            self.list_widget.addItem(msg)
 
     def closeEvent(self, event):
         event.ignore()
@@ -287,7 +308,9 @@ class MainWin(qtw.QWidget):
 
     def transfer_clicked(self):
         if not os.path.exists(parent_path):
-            raise FileNotFoundError(f"{parent_path} 경로가 존재하지 않습니다.")
+            # UI 개선 #3: raise 대신 QMessageBox.critical()로 사용자에게 에러 표시
+            qtw.QMessageBox.critical(self, "경로 오류", f"{parent_path} 경로가 존재하지 않습니다.")
+            return
 
         completion_messages = ""
 
@@ -335,9 +358,10 @@ class MainWin(qtw.QWidget):
             else:
                 completion_messages += f"{date_folder} 이전 작업 완료\n"
 
-        self.label.setText(completion_messages)
+        self.update_list(completion_messages.strip().splitlines())
 
-        messageBox = qtw.QMessageBox()
+        # UI 개선 #5: 부모 위젯 self 지정
+        messageBox = qtw.QMessageBox(self)
         messageBox.setWindowTitle("File Transfer")
         messageBox.setText("파일 이전 작업이 완료되었습니다.")
         messageBox.exec()
