@@ -415,6 +415,7 @@ if __name__ == "__main__":
 
     attach_list = save_attachments(outlook_mapi)
     app = qtw.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     sys.exit(app.exec())
