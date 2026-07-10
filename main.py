@@ -16,8 +16,8 @@ ref_num_key = re.compile(
 name_key = re.compile(r"; [ㄱ-ㅎ|ㅏ-ㅣ|가-힣]+(?=\()")
 
 # 경로 설정 (환경에 맞게 수정하세요)
-parent_path = r"C:\Dropbox\1_Projects\Tasks"
-target_path = r"C:\Dropbox\4_Archives\04_Work\02_Review"
+parent_path = r"C:\OneDrive - WorkSpace\1_MyWork\1_Projects\Tasks"
+target_path = r"C:\OneDrive - WorkSpace\1_MyWork\4_Archives\04_Work\02_Review"
 
 
 def resource_path(relative_path):
