@@ -323,6 +323,15 @@ class MainWin(qtw.QWidget):
         self.tab_tasks = qtw.QWidget()
         tasks_layout = qtw.QVBoxLayout()
         
+        transfer_btn = qtw.QPushButton("File Transfer")
+        transfer_btn.clicked.connect(self.transfer_clicked)
+        
+        btn_layout_tasks = qtw.QHBoxLayout()
+        btn_layout_tasks.addStretch()
+        btn_layout_tasks.addWidget(transfer_btn)
+        
+        tasks_layout.addLayout(btn_layout_tasks)
+        
         notice = qtw.QGroupBox("Messages")
         notice_layout = qtw.QVBoxLayout()
 
@@ -345,28 +354,41 @@ class MainWin(qtw.QWidget):
             
         notice_layout.addWidget(self.table_widget)
         notice.setLayout(notice_layout)
-
-        transfer_btn = qtw.QPushButton("File Transfer")
-        transfer_btn.clicked.connect(self.transfer_clicked)
         
         tasks_layout.addWidget(notice)
-        tasks_layout.addWidget(transfer_btn)
         self.tab_tasks.setLayout(tasks_layout)
 
         # 2. History 탭 생성
         self.tab_history = qtw.QWidget()
         history_layout = qtw.QVBoxLayout()
-        self.history_text = qtw.QTextEdit()
-        self.history_text.setReadOnly(True)
+        
         refresh_btn = qtw.QPushButton("Refresh History")
         refresh_btn.clicked.connect(self.load_history)
+        
+        btn_layout_history = qtw.QHBoxLayout()
+        btn_layout_history.addStretch()
+        btn_layout_history.addWidget(refresh_btn)
+        history_layout.addLayout(btn_layout_history)
+        
+        self.history_text = qtw.QTextEdit()
+        self.history_text.setReadOnly(True)
         history_layout.addWidget(self.history_text)
-        history_layout.addWidget(refresh_btn)
+        
         self.tab_history.setLayout(history_layout)
         self.load_history()
 
         # 3. Settings 탭 생성
         self.tab_settings = qtw.QWidget()
+        settings_main_layout = qtw.QVBoxLayout()
+        
+        save_settings_btn = qtw.QPushButton("Save Settings")
+        save_settings_btn.clicked.connect(self.save_settings_ui)
+        
+        btn_layout_settings = qtw.QHBoxLayout()
+        btn_layout_settings.addStretch()
+        btn_layout_settings.addWidget(save_settings_btn)
+        settings_main_layout.addLayout(btn_layout_settings)
+        
         settings_layout = qtw.QFormLayout()
         
         self.parent_path_edit = qtw.QLineEdit(config["parent_path"])
@@ -383,13 +405,11 @@ class MainWin(qtw.QWidget):
         target_box.addWidget(self.target_path_edit)
         target_box.addWidget(target_btn)
         
-        save_settings_btn = qtw.QPushButton("Save Settings")
-        save_settings_btn.clicked.connect(self.save_settings_ui)
-        
         settings_layout.addRow("Parent Path (Tasks):", parent_box)
         settings_layout.addRow("Target Path (Review):", target_box)
-        settings_layout.addRow("", save_settings_btn)
-        self.tab_settings.setLayout(settings_layout)
+        
+        settings_main_layout.addLayout(settings_layout)
+        self.tab_settings.setLayout(settings_main_layout)
 
         # 탭 추가
         self.tabs.addTab(self.tab_tasks, "Tasks")
@@ -401,6 +421,7 @@ class MainWin(qtw.QWidget):
         win_layout.addWidget(self.tabs)
         
         quit_btn = qtw.QPushButton("Quit")
+        quit_btn.setObjectName("quitButton")
         quit_btn.clicked.connect(self.quit_clicked)
         win_layout.addWidget(quit_btn)
 
@@ -574,6 +595,100 @@ if __name__ == "__main__":
 
     attach_list = save_attachments(outlook_mapi)
     app = qtw.QApplication(sys.argv)
+    
+    # Soft Pastel Nature Mode 테마 적용
+    app.setStyleSheet("""
+        QWidget {
+            background-color: #F9F9F6;
+            color: #3A403D;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            font-size: 13px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #D6D6D2;
+            background-color: #F9F9F6;
+            border-radius: 4px;
+        }
+        QTabBar::tab {
+            background: #EFEFEA;
+            border: 1px solid #D6D6D2;
+            padding: 8px 16px;
+            margin-right: 2px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+            color: #5C6360;
+        }
+        QTabBar::tab:selected {
+            background: #F9F9F6;
+            border-bottom-color: #F9F9F6;
+            color: #3A403D;
+            font-weight: bold;
+            border-top: 3px solid #88A98E;
+        }
+        QTabBar::tab:hover {
+            background: #E8E8E3;
+        }
+        QPushButton {
+            background-color: #88A98E;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 8px 16px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #739278;
+        }
+        QPushButton:pressed {
+            background-color: #5E7A63;
+        }
+        QTableWidget {
+            background-color: white;
+            alternate-background-color: #F4F4F0;
+            border: 1px solid #D6D6D2;
+            gridline-color: #E2E2DF;
+        }
+        QHeaderView::section {
+            background-color: #EFEFEA;
+            padding: 4px;
+            border: none;
+            border-right: 1px solid #D6D6D2;
+            border-bottom: 1px solid #D6D6D2;
+            font-weight: bold;
+        }
+        QTextEdit, QLineEdit {
+            background-color: white;
+            border: 1px solid #D6D6D2;
+            border-radius: 4px;
+            padding: 4px;
+        }
+        QTextEdit:focus, QLineEdit:focus {
+            border: 1px solid #88A98E;
+        }
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid #D6D6D2;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            padding: 0 3px;
+            left: 10px;
+        }
+        #quitButton {
+            background-color: #E29578;
+            color: white;
+        }
+        #quitButton:hover {
+            background-color: #C0795E;
+        }
+        #quitButton:pressed {
+            background-color: #A3644B;
+        }
+    """)
+    
     app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
