@@ -6,7 +6,7 @@ def build_exe():
     # 1. 빌드 설정
     entry_point = "main.py"  # 실행 파일의 시작점
     exe_name = "TaskManager"   # 생성될 EXE 파일 이름
-    icon_file = "attach_down.ico" # EXE 아이콘
+    icon_file = "app_icon.ico" # EXE 아이콘
     
     # 추가 데이터 파일 (이미지 등)
     # 형식: "소스파일;대상폴더" (Windows 기준)
