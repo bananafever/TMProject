@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import logging
+import shutil
 from datetime import datetime, time, timedelta
 
 import pytz
@@ -504,82 +505,107 @@ class MainWin(qtw.QWidget):
         self.hide()
 
     def transfer_clicked(self):
-        p_path = config["parent_path"]
-        t_path = config["target_path"]
-        
-        if not os.path.exists(p_path):
-            # UI 개선 #3: raise 대신 QMessageBox.critical()로 사용자에게 에러 표시
-            qtw.QMessageBox.critical(self, "경로 오류", f"{p_path} 경로가 존재하지 않습니다.")
-            logging.error(f"경로 오류: {p_path} 경로가 존재하지 않습니다.")
-            return
+        try:
+            p_path = config.get("parent_path", "")
+            t_path = config.get("target_path", "")
+            
+            if not p_path or not os.path.exists(p_path):
+                qtw.QMessageBox.critical(self, "경로 오류", f"작업 경로(Parent Path)가 존재하지 않습니다:\n{p_path}")
+                logging.error(f"경로 오류: {p_path} 경로가 존재하지 않습니다.")
+                return
 
-        completion_messages = []
+            if not t_path:
+                qtw.QMessageBox.critical(self, "경로 오류", "이전 대상 경로(Target Path)가 설정되지 않았습니다.")
+                logging.error("경로 오류: target_path가 설정되지 않았습니다.")
+                return
 
-        if not os.listdir(p_path):
-            self.update_table([("", "", "", "이전할 파일이 없습니다.")])
-            return
+            create_dir_if_not_exists(t_path)
 
-        for date_folder in os.listdir(p_path):
-            folder_path = os.path.join(p_path, date_folder)
+            if not os.listdir(p_path):
+                self.update_table([("", "", "", "이전할 파일이 없습니다.")])
+                qtw.QMessageBox.information(self, "File Transfer", "이전할 파일이 없습니다.")
+                return
 
-            # 개선 #3: 파일이 섞여 있을 경우를 대비해 폴더 여부 확인
-            if not os.path.isdir(folder_path):
-                continue
+            completion_messages = []
 
-            for case_folder in os.listdir(folder_path):
-                origin_path = os.path.join(folder_path, case_folder)
+            for date_folder in os.listdir(p_path):
+                folder_path = os.path.join(p_path, date_folder)
 
-                # 수정 #1: case_folder가 파일이면 건너뜀 (NotADirectoryError 방지)
-                if not os.path.isdir(origin_path):
+                if not os.path.isdir(folder_path):
                     continue
 
-                try:
-                    # 개선 #2: split("_", 2)로 이름에 _ 포함된 경우도 안전하게 처리
-                    time_info, ref_info, person_info = case_folder.split("_", 2)
-                    target_folder_name = (
-                        f"{ref_info}\\{date_folder}_{time_info}_{person_info}"
-                    )
-                    label_ref = ref_info
-                    label_name = person_info
-                except ValueError:
-                    target_folder_name = f"{case_folder}"
-                    label_ref = case_folder
-                    label_name = ""
+                for case_folder in os.listdir(folder_path):
+                    origin_path = os.path.join(folder_path, case_folder)
 
-                create_dir_if_not_exists(os.path.join(t_path, target_folder_name))
+                    if not os.path.isdir(origin_path):
+                        continue
 
-                failed = False
-                for file_name in os.listdir(origin_path):
-                    file_path = os.path.join(origin_path, file_name)
-                    # 수정 #2: os.rename() 예외 처리 — 권한 오류·동일 파일명 충돌 대응
                     try:
-                        os.rename(
-                            file_path,
-                            os.path.join(t_path, target_folder_name, file_name),
-                        )
-                    except OSError as e:
-                        logging.error(f"파일 이동 실패 ({file_name}): {e}")
-                        failed = True
+                        time_info, ref_info, person_info = case_folder.split("_", 2)
+                        target_folder_name = os.path.join(ref_info, f"{date_folder}_{time_info}_{person_info}")
+                        label_ref = ref_info
+                        label_name = person_info
+                    except ValueError:
+                        target_folder_name = case_folder
+                        label_ref = case_folder
+                        label_name = ""
 
-                if not failed:
-                    os.rmdir(origin_path)
-                    # 수정 #3: 완료 메시지를 튜플로 기록
-                    completion_messages.append((date_folder, label_ref, label_name, "이전 완료"))
-                else:
-                    completion_messages.append((date_folder, label_ref, label_name, "이전 실패(오류)"))
+                    dest_dir = os.path.join(t_path, target_folder_name)
+                    create_dir_if_not_exists(dest_dir)
 
-            # 비어있으면 날짜 폴더도 삭제
-            if not os.listdir(folder_path):
-                os.rmdir(folder_path)
+                    failed = False
+                    files_in_origin = os.listdir(origin_path)
+                    
+                    for file_name in files_in_origin:
+                        file_path = os.path.join(origin_path, file_name)
+                        dst_file_path = os.path.join(dest_dir, file_name)
+                        try:
+                            if os.path.exists(dst_file_path):
+                                if os.path.isdir(dst_file_path):
+                                    shutil.copytree(file_path, dst_file_path, dirs_exist_ok=True)
+                                    if os.path.isdir(file_path):
+                                        shutil.rmtree(file_path)
+                                    else:
+                                        os.remove(file_path)
+                                else:
+                                    os.replace(file_path, dst_file_path)
+                            else:
+                                shutil.move(file_path, dest_dir)
+                        except Exception as e:
+                            logging.error(f"파일/폴더 이동 실패 ({file_name}): {e}")
+                            failed = True
 
-        self.update_table(completion_messages)
-        logging.info("파일 이전 작업 1회 사이클 완료")
+                    if not failed:
+                        try:
+                            if os.path.exists(origin_path) and not os.listdir(origin_path):
+                                os.rmdir(origin_path)
+                            elif os.path.exists(origin_path):
+                                shutil.rmtree(origin_path)
+                            completion_messages.append((date_folder, label_ref, label_name, "이전 완료"))
+                        except Exception as e:
+                            logging.error(f"폴더 삭제 실패 ({origin_path}): {e}")
+                            completion_messages.append((date_folder, label_ref, label_name, "이전 완료(폴더 삭제 잔여)"))
+                    else:
+                        completion_messages.append((date_folder, label_ref, label_name, "이전 실패(오류)"))
 
-        # UI 개선 #5: 부모 위젯 self 지정
-        messageBox = qtw.QMessageBox(self)
-        messageBox.setWindowTitle("File Transfer")
-        messageBox.setText("파일 이전 작업이 완료되었습니다.")
-        messageBox.exec()
+                if os.path.exists(folder_path) and not os.listdir(folder_path):
+                    try:
+                        os.rmdir(folder_path)
+                    except Exception as e:
+                        logging.error(f"날짜 폴더 삭제 실패 ({folder_path}): {e}")
+
+            if completion_messages:
+                self.update_table(completion_messages)
+                logging.info(f"파일 이전 작업 1회 사이클 완료 ({len(completion_messages)}개 항목 처리)")
+                qtw.QMessageBox.information(self, "File Transfer", f"파일 이전 작업이 완료되었습니다.\n(총 {len(completion_messages)}개 항목 처리)")
+            else:
+                self.update_table([("", "", "", "이전할 파일이 없습니다.")])
+                logging.info("파일 이전 작업 완료: 이전할 항목 없음")
+                qtw.QMessageBox.information(self, "File Transfer", "이전할 파일이 없습니다.")
+
+        except Exception as e:
+            logging.error(f"File Transfer 중 오류 발생: {e}", exc_info=True)
+            qtw.QMessageBox.critical(self, "오류 발생", f"파일 이전 중 오류가 발생했습니다:\n{e}")
 
     def quit_clicked(self):
         sys.exit()
