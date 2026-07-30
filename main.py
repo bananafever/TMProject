@@ -11,6 +11,7 @@ from time import sleep
 import pytz
 import win32com.client
 from dateutil.relativedelta import relativedelta
+from PySide6 import QtCore as qtc
 from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
 
@@ -219,6 +220,112 @@ def check_duplicate_appointment(folder, subject, start_date):
     return False
 
 
+class ScheduleEditDialog(qtw.QDialog):
+    """캘린더 일정 자동 등록 시 날짜 확인 및 수정을 위한 모달 다이얼로그"""
+
+    def __init__(self, parent=None, ref_num="", subj_comments="", target_date=None, subj_action="", response_date=None):
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Registration & Edit")
+        self.resize(440, 280)
+
+        self.ref_num = ref_num
+        self.subj_comments = subj_comments
+        self.target_date = target_date
+        self.subj_action = subj_action
+        self.response_date = response_date
+
+        self.initUI()
+
+    def initUI(self):
+        layout = qtw.QVBoxLayout(self)
+
+        info_label = qtw.QLabel(
+            f"<b>[Ref: {self.ref_num}]</b> 캘린더 자동 등록 일정 확인<br>"
+            "등록할 일정을 확인하고 날짜를 필요에 맞게 수정하세요."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # 1. Comments 일정 그룹
+        comments_group = qtw.QGroupBox("Comments 일정 (Folder: Mail)")
+        comments_layout = qtw.QHBoxLayout()
+
+        self.chk_comments = qtw.QCheckBox("등록")
+        self.chk_comments.setChecked(True)
+
+        lbl_comments = qtw.QLabel(self.subj_comments)
+        lbl_comments.setMinimumWidth(140)
+
+        self.date_comments = qtw.QDateEdit()
+        self.date_comments.setCalendarPopup(True)
+        self.date_comments.setDisplayFormat("yyyy-MM-dd")
+        if self.target_date:
+            self.date_comments.setDate(qtc.QDate(self.target_date.year, self.target_date.month, self.target_date.day))
+
+        comments_layout.addWidget(self.chk_comments)
+        comments_layout.addWidget(lbl_comments)
+        comments_layout.addWidget(self.date_comments)
+        comments_group.setLayout(comments_layout)
+        layout.addWidget(comments_group)
+
+        # 2. Action 일정 그룹
+        action_group = qtw.QGroupBox("Action 일정 (Folder: No_Instructions)")
+        action_layout = qtw.QHBoxLayout()
+
+        self.chk_action = qtw.QCheckBox("등록")
+        self.chk_action.setChecked(True)
+
+        lbl_action = qtw.QLabel(self.subj_action)
+        lbl_action.setMinimumWidth(140)
+
+        self.date_action = qtw.QDateEdit()
+        self.date_action.setCalendarPopup(True)
+        self.date_action.setDisplayFormat("yyyy-MM-dd")
+        if self.response_date:
+            self.date_action.setDate(qtc.QDate(self.response_date.year, self.response_date.month, self.response_date.day))
+
+        action_layout.addWidget(self.chk_action)
+        action_layout.addWidget(lbl_action)
+        action_layout.addWidget(self.date_action)
+        action_group.setLayout(action_layout)
+        layout.addWidget(action_group)
+
+        self.chk_comments.toggled.connect(self.date_comments.setEnabled)
+        self.chk_action.toggled.connect(self.date_action.setEnabled)
+
+        btn_box = qtw.QHBoxLayout()
+        btn_box.addStretch()
+
+        self.btn_confirm = qtw.QPushButton("등록")
+        self.btn_confirm.clicked.connect(self.accept)
+
+        self.btn_cancel = qtw.QPushButton("취소")
+        self.btn_cancel.setObjectName("quitButton")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        btn_box.addWidget(self.btn_confirm)
+        btn_box.addWidget(self.btn_cancel)
+        layout.addLayout(btn_box)
+
+    def get_results(self):
+        """다이얼로그에서 설정한 결과 반환
+        Returns:
+            (enabled_comments, target_date, enabled_action, response_date)
+        """
+        qdate_comments = self.date_comments.date()
+        qdate_action = self.date_action.date()
+
+        py_target_date = qdate_comments.toPython()
+        py_response_date = qdate_action.toPython()
+
+        return (
+            self.chk_comments.isChecked(),
+            py_target_date,
+            self.chk_action.isChecked(),
+            py_response_date
+        )
+
+
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
 class Handler_Class:
     # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
@@ -291,12 +398,10 @@ class Handler_Class:
 
         target_date = None
         response_date = None
-        utc_timezone = pytz.utc
 
         if match:
             target_date_str = match.group(1)
             target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
-            target_date_utc = utc_timezone.localize(datetime.combine(target_date, time(0, 0, 0)))
 
             four_months_later = target_date + relativedelta(months=4)
 
@@ -305,51 +410,67 @@ class Handler_Class:
             else:
                 receipt_date = message.CreationTime.date()
                 response_date = receipt_date + relativedelta(months=3)
-                
-            response_date_utc = utc_timezone.localize(datetime.combine(response_date, time(0, 0, 0)))
         else:
             target_date = message.CreationTime.date()
-            target_date_utc = message.CreationTime
             response_date = message.CreationTime.date()
-            response_date_utc = message.CreationTime
 
-        dup_comments = check_duplicate_appointment(subfolder, subj_comments, target_date)
-        dup_action = check_duplicate_appointment(subfolder2, subj_action, response_date)
-        
+        # 알림창(대화상자)을 띄워 사용자에게 날짜 확인 및 수정 기회 제공
+        parent_win = qtw.QApplication.activeWindow()
+        dialog = ScheduleEditDialog(
+            parent=parent_win,
+            ref_num=ref_num,
+            subj_comments=subj_comments,
+            target_date=target_date,
+            subj_action=subj_action,
+            response_date=response_date
+        )
+
+        if dialog.exec() != qtw.QDialog.DialogCode.Accepted:
+            logging.info(f"캘린더 일정 등록이 사용자에 의해 취소되었습니다. Ref: {ref_num}")
+            return
+
+        enabled_comments, final_target_date, enabled_action, final_response_date = dialog.get_results()
+
+        utc_timezone = pytz.utc
         msg_parts = []
 
-        if not dup_comments:
-            appointment = subfolder.Items.Add()
-            appointment.Subject = subj_comments
-            appointment.Start = target_date_utc
-            appointment.AllDayEvent = True
-            appointment.Body = f"Task details: {message.Body}"
-            appointment.Save()
-            msg_parts.append(f"추가됨: {subj_comments} ({target_date})")
-            logging.info(f"캘린더 일정 추가됨: {subj_comments} ({target_date})")
-        else:
-            msg_parts.append(f"건너뜀(중복): {subj_comments} ({target_date})")
-            logging.info(f"캘린더 일정 건너뜀(중복): {subj_comments} ({target_date})")
+        if enabled_comments:
+            target_date_utc = utc_timezone.localize(datetime.combine(final_target_date, time(0, 0, 0)))
+            dup_comments = check_duplicate_appointment(subfolder, subj_comments, final_target_date)
+            if not dup_comments:
+                appointment = subfolder.Items.Add()
+                appointment.Subject = subj_comments
+                appointment.Start = target_date_utc
+                appointment.AllDayEvent = True
+                appointment.Body = f"Task details: {message.Body}"
+                appointment.Save()
+                msg_parts.append(f"추가됨: {subj_comments} ({final_target_date})")
+                logging.info(f"캘린더 일정 추가됨: {subj_comments} ({final_target_date})")
+            else:
+                msg_parts.append(f"건너뜀(중복): {subj_comments} ({final_target_date})")
+                logging.info(f"캘린더 일정 건너뜀(중복): {subj_comments} ({final_target_date})")
 
-        if not dup_action:
-            appointment2 = subfolder2.Items.Add()
-            appointment2.Subject = subj_action
-            appointment2.Start = response_date_utc
-            appointment2.AllDayEvent = True
-            appointment2.Body = f"Task details: {message.Body}"
-            appointment2.Save()
-            msg_parts.append(f"추가됨: {subj_action} ({response_date})")
-            logging.info(f"캘린더 일정 추가됨: {subj_action} ({response_date})")
-        else:
-            msg_parts.append(f"건너뜀(중복): {subj_action} ({response_date})")
-            logging.info(f"캘린더 일정 건너뜀(중복): {subj_action} ({response_date})")
+        if enabled_action:
+            response_date_utc = utc_timezone.localize(datetime.combine(final_response_date, time(0, 0, 0)))
+            dup_action = check_duplicate_appointment(subfolder2, subj_action, final_response_date)
+            if not dup_action:
+                appointment2 = subfolder2.Items.Add()
+                appointment2.Subject = subj_action
+                appointment2.Start = response_date_utc
+                appointment2.AllDayEvent = True
+                appointment2.Body = f"Task details: {message.Body}"
+                appointment2.Save()
+                msg_parts.append(f"추가됨: {subj_action} ({final_response_date})")
+                logging.info(f"캘린더 일정 추가됨: {subj_action} ({final_response_date})")
+            else:
+                msg_parts.append(f"건너뜀(중복): {subj_action} ({final_response_date})")
+                logging.info(f"캘린더 일정 건너뜀(중복): {subj_action} ({final_response_date})")
 
-        # UI 개선 #5: 활성 창을 부모로 지정 (Handler_Class에서 MainWin 직접 접근 불가)
-        parent_win = qtw.QApplication.activeWindow()
-        messageBox = qtw.QMessageBox(parent_win)
-        messageBox.setWindowTitle("Schedule Creation Result")
-        messageBox.setText("\n".join(msg_parts))
-        messageBox.exec()
+        if msg_parts:
+            result_box = qtw.QMessageBox(parent_win)
+            result_box.setWindowTitle("Schedule Creation Result")
+            result_box.setText("\n".join(msg_parts))
+            result_box.exec()
 
 
 class MainWin(qtw.QWidget):
@@ -667,7 +788,7 @@ if __name__ == "__main__":
             background-color: #F9F9F6;
             color: #3A403D;
             font-family: 'Segoe UI', Arial, sans-serif;
-            font-size: 13px;
+            font-size: 10pt;
         }
         QTabWidget::pane {
             border: 1px solid #D6D6D2;

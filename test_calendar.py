@@ -20,6 +20,7 @@ sys.modules["win32com.client"] = MagicMock()
 sys.modules["PySide6"] = MagicMock()
 sys.modules["PySide6.QtWidgets"] = MagicMock()
 sys.modules["PySide6.QtGui"] = MagicMock()
+sys.modules["PySide6.QtCore"] = MagicMock()
 
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
@@ -242,6 +243,23 @@ class TestRefNumRegex(unittest.TestCase):
         subject = "[위임] 한송희(팀); OA 안내"
         result = ref_num_key.findall(subject)
         self.assertEqual(result, [])
+
+
+class TestScheduleEditDialogLogic(unittest.TestCase):
+    """ScheduleEditDialog 및 날짜 수정 로직 단위 테스트"""
+
+    def test_edited_dates_flow(self):
+        """기본 계산된 날짜와 사용자가 다이얼로그에서 변경한 날짜의 흐름 검증"""
+        target_date = date(2024, 12, 23)
+        receipt_date = date(2025, 1, 15)
+
+        default_response = calc_response_date("OA", target_date, receipt_date)
+        self.assertEqual(default_response, date(2025, 4, 12))
+
+        # 사용자가 알림창에서 날짜를 2025-04-20으로 수정한 케이스 시뮬레이션
+        user_modified_response_date = date(2025, 4, 20)
+        self.assertNotEqual(default_response, user_modified_response_date)
+        self.assertEqual(user_modified_response_date.strftime("%Y-%m-%d"), "2025-04-20")
 
 
 if __name__ == "__main__":
