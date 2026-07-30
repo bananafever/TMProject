@@ -4,7 +4,9 @@ import sys
 import json
 import logging
 import shutil
+import stat
 from datetime import datetime, time, timedelta
+from time import sleep
 
 import pytz
 import win32com.client
@@ -81,6 +83,46 @@ def create_dir_if_not_exists(directory):
     except OSError:
         logging.error("Error: Creating directory. " + directory)
         return False
+
+
+def safe_remove_path(path, retries=5, delay=0.1):
+    """파일 또는 디렉토리의 읽기 전용 속성을 해제하고 재시도 로직을 포함하여 안전하게 삭제합니다."""
+    if not os.path.exists(path):
+        return True
+
+    def _remove_readonly(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    for i in range(retries):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path, topdown=False):
+                    for name in files:
+                        fp = os.path.join(root, name)
+                        try:
+                            os.chmod(fp, stat.S_IWRITE)
+                        except Exception:
+                            pass
+                    for name in dirs:
+                        dp = os.path.join(root, name)
+                        try:
+                            os.chmod(dp, stat.S_IWRITE)
+                        except Exception:
+                            pass
+                shutil.rmtree(path, onerror=_remove_readonly)
+            else:
+                os.remove(path)
+            return True
+        except Exception as e:
+            if i < retries - 1:
+                sleep(delay)
+            else:
+                raise e
 
 
 def _extract_message_info(message):
@@ -560,14 +602,14 @@ class MainWin(qtw.QWidget):
                         file_path = os.path.join(origin_path, file_name)
                         dst_file_path = os.path.join(dest_dir, file_name)
                         try:
+                            if os.path.exists(file_path):
+                                os.chmod(file_path, stat.S_IWRITE)
                             if os.path.exists(dst_file_path):
                                 if os.path.isdir(dst_file_path):
                                     shutil.copytree(file_path, dst_file_path, dirs_exist_ok=True)
-                                    if os.path.isdir(file_path):
-                                        shutil.rmtree(file_path)
-                                    else:
-                                        os.remove(file_path)
+                                    safe_remove_path(file_path)
                                 else:
+                                    os.chmod(dst_file_path, stat.S_IWRITE)
                                     os.replace(file_path, dst_file_path)
                             else:
                                 shutil.move(file_path, dest_dir)
@@ -577,10 +619,7 @@ class MainWin(qtw.QWidget):
 
                     if not failed:
                         try:
-                            if os.path.exists(origin_path) and not os.listdir(origin_path):
-                                os.rmdir(origin_path)
-                            elif os.path.exists(origin_path):
-                                shutil.rmtree(origin_path)
+                            safe_remove_path(origin_path)
                             completion_messages.append((date_folder, label_ref, label_name, "이전 완료"))
                         except Exception as e:
                             logging.error(f"폴더 삭제 실패 ({origin_path}): {e}")
@@ -590,7 +629,7 @@ class MainWin(qtw.QWidget):
 
                 if os.path.exists(folder_path) and not os.listdir(folder_path):
                     try:
-                        os.rmdir(folder_path)
+                        safe_remove_path(folder_path)
                     except Exception as e:
                         logging.error(f"날짜 폴더 삭제 실패 ({folder_path}): {e}")
 
