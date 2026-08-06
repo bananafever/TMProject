@@ -32,8 +32,8 @@ name_key = re.compile(r"; [ㄱ-ㅎ|ㅏ-ㅣ|가-힣]+(?=\()")
 
 CONFIG_FILE = "settings.json"
 DEFAULT_CONFIG = {
-    "parent_path": r"C:\OneDrive - WorkSpace\1_MyWork\1_Project_Work\Tasks",
-    "target_path": r"C:\OneDrive - WorkSpace\1_MyWork\04_Archives_Work\02_Review"
+    "parent_path": r"C:/Dropbox/1_Project/Tasks",
+    "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review"
 }
 config = DEFAULT_CONFIG.copy()
 
