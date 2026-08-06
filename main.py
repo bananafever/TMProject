@@ -14,6 +14,7 @@ from dateutil.relativedelta import relativedelta
 from PySide6 import QtCore as qtc
 from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
+from PySide6 import QtSvg as qts
 
 # 로깅 설정
 logging.basicConfig(
@@ -69,6 +70,52 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
 
     return os.path.join(base_path, relative_path)
+
+
+NAV_ICONS = {
+    "tasks": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <rect x="3" y="3" width="14" height="14" rx="3" fill="none" stroke="{color}" stroke-width="1.6"/>
+        <path d="M6.5 10 L9 12.5 L14 7" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>""",
+    "history": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <circle cx="10" cy="10" r="7" fill="none" stroke="{color}" stroke-width="1.6"/>
+        <path d="M10 6 V10 L13 12" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>""",
+    "settings": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <path d="M3 6 H17 M3 10 H17 M3 14 H17" stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="7" cy="6" r="1.8" fill="{color}"/>
+        <circle cx="13" cy="10" r="1.8" fill="{color}"/>
+        <circle cx="9" cy="14" r="1.8" fill="{color}"/>
+        </svg>""",
+}
+
+
+def make_icon(svg_key, color="#3A3A38", size=20):
+    """NAV_ICONS의 인라인 SVG 문자열을 렌더링해 QIcon으로 변환합니다."""
+    svg_data = NAV_ICONS[svg_key].format(color=color).encode("utf-8")
+    renderer = qts.QSvgRenderer(qtc.QByteArray(svg_data))
+    pixmap = qtg.QPixmap(size, size)
+    pixmap.fill(qtc.Qt.transparent)
+    painter = qtg.QPainter(pixmap)
+    painter.setRenderHint(qtg.QPainter.Antialiasing, True)
+    renderer.render(painter)
+    painter.end()
+    return qtg.QIcon(pixmap)
+
+
+def setup_app_fonts(app):
+    """assets/fonts에 번들된 Pretendard를 등록하고 앱 전역 글꼴로 지정합니다."""
+    font_dir = resource_path(os.path.join("assets", "fonts"))
+    if os.path.isdir(font_dir):
+        for f in os.listdir(font_dir):
+            if f.lower().endswith((".ttf", ".otf")):
+                qtg.QFontDatabase.addApplicationFont(os.path.join(font_dir, f))
+
+    font = app.font()
+    font.setFamily("Pretendard")
+    font.setStyleStrategy(qtg.QFont.PreferAntialias)
+    font.setHintingPreference(qtg.QFont.PreferNoHinting)
+    app.setFont(font)
 
 
 def create_dir_if_not_exists(directory):
@@ -481,118 +528,154 @@ class MainWin(qtw.QWidget):
         self.initUI()
 
     def initUI(self):
-        self.tabs = qtw.QTabWidget()
-
-        # 1. Tasks 탭 생성
+        # 1. Tasks 탭 생성 (카드형 대시보드)
         self.tab_tasks = qtw.QWidget()
-        tasks_layout = qtw.QVBoxLayout()
-        
+        tasks_layout = qtw.QVBoxLayout(self.tab_tasks)
+        tasks_layout.setContentsMargins(18, 18, 18, 18)
+        tasks_layout.setSpacing(12)
+
+        top_row = qtw.QHBoxLayout()
+        self.tip_label = qtw.QLabel()
+        self.tip_label.setObjectName("tipBox")
+        self.tip_label.setWordWrap(True)
+
         transfer_btn = qtw.QPushButton("File Transfer")
         transfer_btn.clicked.connect(self.transfer_clicked)
-        
-        btn_layout_tasks = qtw.QHBoxLayout()
-        btn_layout_tasks.addStretch()
-        btn_layout_tasks.addWidget(transfer_btn)
-        
-        tasks_layout.addLayout(btn_layout_tasks)
-        
-        notice = qtw.QGroupBox("Messages")
-        notice_layout = qtw.QVBoxLayout()
 
-        # UI 개선 #1: QListWidget 대신 QTableWidget 사용
-        self.table_widget = qtw.QTableWidget()
-        self.table_widget.setColumnCount(4)
-        self.table_widget.setHorizontalHeaderLabels(["일시", "Ref 번호", "담당자", "상태"])
-        
-        header = self.table_widget.horizontalHeader()
-        header.setSectionResizeMode(0, qtw.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, qtw.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, qtw.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, qtw.QHeaderView.Stretch)
-        
-        self.table_widget.setEditTriggers(qtw.QAbstractItemView.NoEditTriggers)
-        self.table_widget.setSelectionBehavior(qtw.QAbstractItemView.SelectRows)
+        top_row.addWidget(self.tip_label, 1)
+        top_row.addWidget(transfer_btn, 0, qtc.Qt.AlignTop)
+        tasks_layout.addLayout(top_row)
+
+        self.cards_container = qtw.QWidget()
+        self.cards_container.setObjectName("cardsContainer")
+        self.cards_layout = qtw.QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.cards_layout.setSpacing(8)
+        self.cards_layout.addStretch()
+
+        self.cards_scroll = qtw.QScrollArea()
+        self.cards_scroll.setWidgetResizable(True)
+        self.cards_scroll.setFrameShape(qtw.QFrame.NoFrame)
+        self.cards_scroll.setWidget(self.cards_container)
+        tasks_layout.addWidget(self.cards_scroll, 1)
 
         for attach in self.attach_list:
             self.add_table_row(*attach)
-            
-        notice_layout.addWidget(self.table_widget)
-        notice.setLayout(notice_layout)
-        
-        tasks_layout.addWidget(notice)
-        self.tab_tasks.setLayout(tasks_layout)
+        self._update_tip()
 
         # 2. History 탭 생성
         self.tab_history = qtw.QWidget()
-        history_layout = qtw.QVBoxLayout()
-        
+        history_layout = qtw.QVBoxLayout(self.tab_history)
+        history_layout.setContentsMargins(18, 18, 18, 18)
+        history_layout.setSpacing(12)
+
         refresh_btn = qtw.QPushButton("Refresh History")
         refresh_btn.clicked.connect(self.load_history)
-        
+
         btn_layout_history = qtw.QHBoxLayout()
         btn_layout_history.addStretch()
         btn_layout_history.addWidget(refresh_btn)
         history_layout.addLayout(btn_layout_history)
-        
+
         self.history_text = qtw.QTextEdit()
         self.history_text.setReadOnly(True)
         history_layout.addWidget(self.history_text)
-        
-        self.tab_history.setLayout(history_layout)
+
         self.load_history()
 
         # 3. Settings 탭 생성
         self.tab_settings = qtw.QWidget()
-        settings_main_layout = qtw.QVBoxLayout()
-        
+        settings_main_layout = qtw.QVBoxLayout(self.tab_settings)
+        settings_main_layout.setContentsMargins(18, 18, 18, 18)
+        settings_main_layout.setSpacing(12)
+
         save_settings_btn = qtw.QPushButton("Save Settings")
         save_settings_btn.clicked.connect(self.save_settings_ui)
-        
+
         btn_layout_settings = qtw.QHBoxLayout()
         btn_layout_settings.addStretch()
         btn_layout_settings.addWidget(save_settings_btn)
         settings_main_layout.addLayout(btn_layout_settings)
-        
+
         settings_layout = qtw.QFormLayout()
-        
+
         self.parent_path_edit = qtw.QLineEdit(config["parent_path"])
         parent_btn = qtw.QPushButton("Browse...")
         parent_btn.clicked.connect(self.browse_parent)
         parent_box = qtw.QHBoxLayout()
         parent_box.addWidget(self.parent_path_edit)
         parent_box.addWidget(parent_btn)
-        
+
         self.target_path_edit = qtw.QLineEdit(config["target_path"])
         target_btn = qtw.QPushButton("Browse...")
         target_btn.clicked.connect(self.browse_target)
         target_box = qtw.QHBoxLayout()
         target_box.addWidget(self.target_path_edit)
         target_box.addWidget(target_btn)
-        
+
         settings_layout.addRow("Parent Path (Tasks):", parent_box)
         settings_layout.addRow("Target Path (Review):", target_box)
-        
-        settings_main_layout.addLayout(settings_layout)
-        self.tab_settings.setLayout(settings_main_layout)
 
-        # 탭 추가
-        self.tabs.addTab(self.tab_tasks, "Tasks")
-        self.tabs.addTab(self.tab_history, "History")
-        self.tabs.addTab(self.tab_settings, "Settings")
+        settings_main_layout.addLayout(settings_layout)
+
+        # 좌측 아이콘 사이드바 + 우측 콘텐츠 스택
+        self.stack = qtw.QStackedWidget()
+        self.stack.addWidget(self.tab_tasks)
+        self.stack.addWidget(self.tab_history)
+        self.stack.addWidget(self.tab_settings)
+
+        self.sidebar = qtw.QWidget()
+        self.sidebar.setObjectName("navBar")
+        self.sidebar.setFixedWidth(128)
+        side_layout = qtw.QVBoxLayout(self.sidebar)
+        side_layout.setContentsMargins(8, 20, 8, 20)
+        side_layout.setSpacing(10)
+
+        self.nav_group = qtw.QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+
+        nav_specs = [("tasks", "Tasks"), ("history", "History"), ("settings", "Settings")]
+        for i, (icon_key, label) in enumerate(nav_specs):
+            btn = qtw.QToolButton()
+            btn.setObjectName("navBtn")
+            btn.setCheckable(True)
+            btn.setToolButtonStyle(qtc.Qt.ToolButtonTextUnderIcon)
+            btn.setIcon(make_icon(icon_key))
+            btn.setIconSize(qtc.QSize(30, 30))
+            btn.setText(label)
+            btn.setFixedSize(108, 76)
+            side_layout.addWidget(btn, 0, qtc.Qt.AlignHCenter)
+            self.nav_group.addButton(btn, i)
+        side_layout.addStretch()
+
+        self.nav_group.idClicked.connect(self.stack.setCurrentIndex)
+        self.nav_group.button(0).setChecked(True)
+
+        content_row = qtw.QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(0)
+        content_row.addWidget(self.sidebar)
+        content_row.addWidget(self.stack, 1)
 
         # 메인 레이아웃 구성
         win_layout = qtw.QVBoxLayout()
-        win_layout.addWidget(self.tabs)
-        
+        win_layout.setContentsMargins(0, 0, 0, 0)
+        win_layout.setSpacing(0)
+        win_layout.addLayout(content_row, 1)
+
+        quit_row = qtw.QHBoxLayout()
+        quit_row.setContentsMargins(18, 8, 18, 14)
         quit_btn = qtw.QPushButton("Quit")
         quit_btn.setObjectName("quitButton")
         quit_btn.clicked.connect(self.quit_clicked)
-        win_layout.addWidget(quit_btn)
+        quit_row.addStretch()
+        quit_row.addWidget(quit_btn)
+        win_layout.addLayout(quit_row)
 
         self.setLayout(win_layout)
         self.setWindowTitle("Task Manager")
         self.setWindowIcon(qtg.QIcon(resource_path("icon.png")))
-        self.resize(500, 400)
+        self.resize(560, 460)
 
         # UI 개선 #2: 하드코딩된 move(300,300) 대신 화면 중앙에 배치
         screen_geometry = qtw.QApplication.primaryScreen().availableGeometry()
@@ -624,10 +707,11 @@ class MainWin(qtw.QWidget):
             self.activateWindow()
 
     def update_table(self, messages_data):
-        """테이블 내용을 모두 지우고 새 데이터를 추가합니다."""
-        self.table_widget.setRowCount(0)
+        """카드 목록을 모두 지우고 새 데이터를 추가합니다."""
+        self._clear_cards()
         for data in messages_data:
             self.add_table_row(*data)
+        self._update_tip()
 
     def load_history(self):
         try:
@@ -655,13 +739,68 @@ class MainWin(qtw.QWidget):
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")
 
     def add_table_row(self, dt, ref, name, status):
-        """테이블에 새 행을 추가합니다."""
-        row_idx = self.table_widget.rowCount()
-        self.table_widget.insertRow(row_idx)
-        self.table_widget.setItem(row_idx, 0, qtw.QTableWidgetItem(dt))
-        self.table_widget.setItem(row_idx, 1, qtw.QTableWidgetItem(ref))
-        self.table_widget.setItem(row_idx, 2, qtw.QTableWidgetItem(name))
-        self.table_widget.setItem(row_idx, 3, qtw.QTableWidgetItem(status))
+        """메시지 카드를 하나 추가합니다."""
+        row_idx = self.cards_layout.count() - 1  # 마지막 stretch 앞에 삽입
+
+        card = qtw.QFrame()
+        card.setObjectName("msgCard")
+        card_layout = qtw.QHBoxLayout(card)
+        card_layout.setContentsMargins(14, 10, 14, 10)
+        card_layout.setSpacing(12)
+
+        badge = qtw.QLabel(str(row_idx + 1))
+        badge.setObjectName("cardBadge")
+        badge.setFixedSize(28, 28)
+        badge.setAlignment(qtc.Qt.AlignCenter)
+        card_layout.addWidget(badge)
+
+        info_layout = qtw.QVBoxLayout()
+        info_layout.setSpacing(2)
+        title = " · ".join(part for part in (ref, name) if part)
+        title_label = qtw.QLabel(title or "-")
+        title_label.setObjectName("cardTitle")
+        subtitle_label = qtw.QLabel(dt or "")
+        subtitle_label.setObjectName("cardSubtitle")
+        info_layout.addWidget(title_label)
+        info_layout.addWidget(subtitle_label)
+        card_layout.addLayout(info_layout, 1)
+
+        bg, fg = self._status_pill_colors(status)
+        status_label = qtw.QLabel()
+        status_label.setFixedWidth(132)
+        status_label.setAlignment(qtc.Qt.AlignCenter)
+        status_label.setToolTip(status)
+        metrics = status_label.fontMetrics()
+        status_label.setText(metrics.elidedText(status, qtc.Qt.ElideRight, 132 - 16))
+        status_label.setStyleSheet(
+            f"background-color:{bg}; color:{fg}; padding:4px 6px; border-radius:8px; font-size:9pt;"
+        )
+        card_layout.addWidget(status_label, 0, qtc.Qt.AlignVCenter)
+
+        self.cards_layout.insertWidget(row_idx, card)
+
+    def _clear_cards(self):
+        """stretch를 제외한 모든 메시지 카드를 제거합니다."""
+        while self.cards_layout.count() > 1:
+            item = self.cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _update_tip(self):
+        count = self.cards_layout.count() - 1
+        if count > 0:
+            self.tip_label.setText(f"자동으로 처리된 {count}건의 항목이 있습니다.")
+        else:
+            self.tip_label.setText("표시할 항목이 없습니다.")
+
+    @staticmethod
+    def _status_pill_colors(status):
+        if any(keyword in status for keyword in ("실패", "오류")):
+            return "#FAECE7", "#993C1D"
+        if any(keyword in status for keyword in ("Existing", "완료", "Downloaded")):
+            return "#E1EEE7", "#1B4B43"
+        return "#F2F2F0", "#5F5E5A"
 
     def closeEvent(self, event):
         event.ignore()
@@ -781,80 +920,93 @@ if __name__ == "__main__":
 
     attach_list = save_attachments(outlook_mapi)
     app = qtw.QApplication(sys.argv)
-    
-    # Soft Pastel Nature Mode 테마 적용
+    setup_app_fonts(app)
+
+    # pdfProject Clean Light 테마 참고 (웜 뉴트럴 캔버스 + 틸/오렌지 액센트)
     app.setStyleSheet("""
         QWidget {
-            background-color: #F9F9F6;
-            color: #3A403D;
-            font-family: 'Segoe UI', Arial, sans-serif;
+            background-color: #F6F6F4;
+            color: #333333;
+            font-family: 'Pretendard', 'Malgun Gothic', sans-serif;
             font-size: 10pt;
         }
-        QTabWidget::pane {
-            border: 1px solid #D6D6D2;
-            background-color: #F9F9F6;
-            border-radius: 4px;
+        #navBar {
+            background-color: #F6F6F4;
+            border-right: 1px solid #DCE3DF;
         }
-        QTabBar::tab {
-            background: #EFEFEA;
-            border: 1px solid #D6D6D2;
-            padding: 8px 16px;
-            margin-right: 2px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            color: #5C6360;
+        QToolButton#navBtn {
+            background: transparent;
+            border: 2px solid transparent;
+            border-radius: 12px;
+            padding: 6px;
+            color: #4B4A47;
+            font-size: 10pt;
+            text-align: center;
         }
-        QTabBar::tab:selected {
-            background: #F9F9F6;
-            border-bottom-color: #F9F9F6;
-            color: #3A403D;
+        QToolButton#navBtn:checked {
+            background-color: white;
+            border: 2px solid #E8611C;
+            color: #232220;
             font-weight: bold;
-            border-top: 3px solid #88A98E;
         }
-        QTabBar::tab:hover {
-            background: #E8E8E3;
+        QToolButton#navBtn:hover:!checked {
+            background-color: #ECEAE5;
+        }
+        #tipBox {
+            background-color: #E1EEE7;
+            color: #1B4B43;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-size: 9.5pt;
+        }
+        #msgCard {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 12px;
+        }
+        #cardBadge {
+            background-color: #26695E;
+            color: white;
+            border-radius: 14px;
+            font-size: 9pt;
+            font-weight: bold;
+        }
+        #cardTitle {
+            color: #232220;
+            font-size: 10pt;
+            font-weight: bold;
+        }
+        #cardSubtitle {
+            color: #8A877E;
+            font-size: 9pt;
         }
         QPushButton {
-            background-color: #88A98E;
+            background-color: #26695E;
             color: white;
             border: none;
-            border-radius: 4px;
+            border-radius: 10px;
             padding: 8px 16px;
             font-weight: bold;
         }
         QPushButton:hover {
-            background-color: #739278;
+            background-color: #2F7C6E;
         }
         QPushButton:pressed {
-            background-color: #5E7A63;
-        }
-        QTableWidget {
-            background-color: white;
-            alternate-background-color: #F4F4F0;
-            border: 1px solid #D6D6D2;
-            gridline-color: #E2E2DF;
-        }
-        QHeaderView::section {
-            background-color: #EFEFEA;
-            padding: 4px;
-            border: none;
-            border-right: 1px solid #D6D6D2;
-            border-bottom: 1px solid #D6D6D2;
-            font-weight: bold;
+            background-color: #1B4B43;
         }
         QTextEdit, QLineEdit {
             background-color: white;
-            border: 1px solid #D6D6D2;
-            border-radius: 4px;
+            border: 1px solid #DCE3DF;
+            border-radius: 8px;
             padding: 4px;
         }
         QTextEdit:focus, QLineEdit:focus {
-            border: 1px solid #88A98E;
+            border: 1px solid #26695E;
         }
         QGroupBox {
             font-weight: bold;
-            border: 1px solid #D6D6D2;
-            border-radius: 4px;
+            border: 1px solid #DCE3DF;
+            border-radius: 10px;
             margin-top: 10px;
         }
         QGroupBox::title {
@@ -863,18 +1015,25 @@ if __name__ == "__main__":
             padding: 0 3px;
             left: 10px;
         }
+        QScrollArea, #cardsContainer {
+            background-color: transparent;
+            border: none;
+        }
         #quitButton {
-            background-color: #E29578;
-            color: white;
+            background-color: white;
+            color: #993C1D;
+            border: 1px solid #F0997B;
+            border-radius: 10px;
+            font-weight: normal;
         }
         #quitButton:hover {
-            background-color: #C0795E;
+            background-color: #FAECE7;
         }
         #quitButton:pressed {
-            background-color: #A3644B;
+            background-color: #F5C4B3;
         }
     """)
-    
+
     app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입

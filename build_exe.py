@@ -12,6 +12,7 @@ def build_exe():
     # 형식: "소스파일;대상폴더" (Windows 기준)
     datas = [
         ("icon.png", "."),
+        ("assets/fonts", "assets/fonts"),
     ]
     
     # 숨겨진 임포트 (발견되지 않는 모듈 강제 포함)

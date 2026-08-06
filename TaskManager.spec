@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('icon.png', '.')],
+    datas=[('icon.png', '.'), ('assets/fonts', 'assets/fonts')],
     hiddenimports=['win32timezone'],
     hookspath=[],
     hooksconfig={},
