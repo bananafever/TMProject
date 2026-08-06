@@ -142,13 +142,23 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# PyCharm
+# PyCharm & VS Code
 .idea/
+.vscode/
 
-# Custom project ignores
+# AI Agent / IDE tools
+.gemini/
+.agents/
+.claude/
+
+# Executables
+*.exe
+
+# Custom project ignores & Local settings
 EK_TRANS_DIC/
 keywords/
 CLAUDE.md
+settings.json
 
 # OS files
 .DS_Store
@@ -158,3 +168,5 @@ CLAUDE.md
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
+Desktop.ini
