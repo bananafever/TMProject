@@ -9,7 +9,22 @@ from datetime import datetime, time, timedelta
 from time import sleep
 
 import pytz
-import win32com.client
+try:
+    import win32com.client
+except Exception:
+    # gen_py 캐시가 손상된 경우 (%LOCALAPPDATA%\Temp\gen_py 등) 자동 삭제 후 재시도
+    import tempfile
+    gen_py_dirs = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Temp\gen_py"),
+        os.path.join(tempfile.gettempdir(), "gen_py"),
+    ]
+    for d in gen_py_dirs:
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("win32com"):
+            del sys.modules[mod]
+    import win32com.client
 from dateutil.relativedelta import relativedelta
 from PySide6 import QtCore as qtc
 from PySide6 import QtGui as qtg
