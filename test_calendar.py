@@ -10,7 +10,7 @@
 import sys
 import unittest
 from datetime import date, datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 # -----------------------------------------------------------------------
 # win32com, PySide6는 실제 Outlook/GUI 없이도 테스트할 수 있도록 mock 처리
@@ -260,6 +260,91 @@ class TestScheduleEditDialogLogic(unittest.TestCase):
         user_modified_response_date = date(2025, 4, 20)
         self.assertNotEqual(default_response, user_modified_response_date)
         self.assertEqual(user_modified_response_date.strftime("%Y-%m-%d"), "2025-04-20")
+
+
+class TestSenderFilter(unittest.TestCase):
+    """SenderName 직접 접근 없이 보낸 사람을 판정하는 로직 테스트 (Outlook 보안 경고 회피)"""
+
+    def test_single_sender(self):
+        self.assertEqual(
+            main.build_sender_filter(["DoNotReply"]),
+            "@SQL=(\"urn:schemas:httpmail:fromname\" = 'DoNotReply')",
+        )
+
+    def test_multiple_senders_with_brackets(self):
+        f = main.build_sender_filter(["DoNotReply", "Yong-Sok SHIN [신용석]"])
+        self.assertEqual(
+            f,
+            "@SQL=(\"urn:schemas:httpmail:fromname\" = 'DoNotReply'"
+            " OR \"urn:schemas:httpmail:fromname\" = 'Yong-Sok SHIN [신용석]')",
+        )
+
+    def test_subject_and_quote_escape(self):
+        f = main.build_sender_filter(["O'Brien"], subject="[위임] it's")
+        self.assertIn("= 'O''Brien')", f)
+        self.assertTrue(
+            f.endswith(" AND \"urn:schemas:httpmail:subject\" = '[위임] it''s'")
+        )
+
+    def test_empty_senders_raises(self):
+        with self.assertRaises(ValueError):
+            main.build_sender_filter([])
+
+    @staticmethod
+    def _make_message(entry_id, restricted_ids):
+        message = MagicMock()
+        message.EntryID = entry_id
+        message.Subject = "[위임] PJA-2R8603; 한송희(팀); OA [서 2024-12-23]; 001"
+        items = []
+        for rid in restricted_ids:
+            item = MagicMock()
+            item.EntryID = rid
+            items.append(item)
+        message.Parent.Items.Restrict.return_value = items
+        # SenderName에 접근하면 실패하도록 설정 (보안 경고 유발 속성)
+        type(message).SenderName = PropertyMock(side_effect=AssertionError("SenderName 접근"))
+        return message
+
+    def test_sender_matches_found(self):
+        message = self._make_message("ID1", ["ID0", "ID1"])
+        self.assertTrue(main.sender_matches(message, ["DoNotReply"]))
+        used_filter = message.Parent.Items.Restrict.call_args[0][0]
+        self.assertEqual(used_filter, main.build_sender_filter(["DoNotReply"], message.Subject))
+
+    def test_sender_matches_not_found(self):
+        message = self._make_message("ID9", ["ID0", "ID1"])
+        self.assertFalse(main.sender_matches(message, ["DoNotReply"]))
+
+    def test_sender_matches_fallback_on_restrict_error(self):
+        message = MagicMock()
+        message.Subject = "[위임] test"
+        message.Parent.Items.Restrict.side_effect = Exception("Restrict 실패")
+        message.SenderName = "DoNotReply"
+        self.assertTrue(main.sender_matches(message, ["DoNotReply"]))
+        message.SenderName = "Someone"
+        self.assertFalse(main.sender_matches(message, ["DoNotReply"]))
+
+    def test_save_attachments_uses_restrict_without_sender_name(self):
+        delegated = MagicMock()
+        delegated.Subject = "[위임] PJA-2R8603; 한송희(팀); OA [서 2024-12-23]; 001"
+        delegated.Attachments.Count = 1
+        type(delegated).SenderName = PropertyMock(side_effect=AssertionError("SenderName 접근"))
+
+        no_attach = MagicMock()
+        no_attach.Subject = "[위임] 첨부 없음"
+        no_attach.Attachments.Count = 0
+        type(no_attach).SenderName = PropertyMock(side_effect=AssertionError("SenderName 접근"))
+
+        outlook = MagicMock()
+        restrict = outlook.GetDefaultFolder.return_value.Items.Restrict
+        restrict.return_value = [delegated, no_attach]
+
+        with patch.object(main, "_save_attachments_for_message") as save_one:
+            main.save_attachments(outlook)
+
+        restrict.assert_called_once_with(main.build_sender_filter(main.DELEGATION_SENDERS))
+        save_one.assert_called_once()
+        self.assertIs(save_one.call_args[0][0], delegated)
 
 
 if __name__ == "__main__":

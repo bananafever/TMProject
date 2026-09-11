@@ -188,6 +188,53 @@ def safe_remove_path(path, retries=5, delay=0.1):
                 raise e
 
 
+# Outlook Object Model Guard는 MailItem.SenderName 같은 주소 관련 속성을 외부 프로세스가
+# 직접 읽을 때마다 "전자 메일 주소 정보에 액세스" 보안 경고를 띄운다.
+# Items.Restrict 필터는 보호 대상이 아니므로, 보낸 사람 판정은 필터로 처리한다.
+DELEGATION_SENDERS = ["DoNotReply"]  # 위임 메일 첨부 저장 대상 보낸 사람
+CALENDAR_SENDERS = ["DoNotReply", "Yong-Sok SHIN [신용석]"]  # 캘린더 등록 대상 보낸 사람
+
+_DASL_FROMNAME = '"urn:schemas:httpmail:fromname"'
+_DASL_SUBJECT = '"urn:schemas:httpmail:subject"'
+
+
+def _dasl_str(value):
+    """DASL 문자열 리터럴로 변환합니다 (작은따옴표는 '' 로 이스케이프)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_sender_filter(sender_names, subject=None):
+    """보낸 사람 이름(선택적으로 제목까지)으로 Items.Restrict용 DASL 필터를 만듭니다."""
+    if not sender_names:
+        raise ValueError("sender_names가 비어 있습니다.")
+    sender_cond = " OR ".join(f"{_DASL_FROMNAME} = {_dasl_str(n)}" for n in sender_names)
+    query = f"({sender_cond})"
+    if subject is not None:
+        query += f" AND {_DASL_SUBJECT} = {_dasl_str(subject)}"
+    return "@SQL=" + query
+
+
+def sender_matches(message, sender_names):
+    """SenderName을 직접 읽지 않고 message의 보낸 사람이 sender_names 중 하나인지 확인합니다.
+
+    message가 들어 있는 폴더에 보낸 사람+제목 필터를 걸고, 결과에 같은 EntryID가 있는지 봅니다.
+    필터가 실패하면 SenderName 직접 비교로 대체합니다 (이 경우 보안 경고가 뜰 수 있음).
+    """
+    try:
+        entry_id = message.EntryID
+        items = message.Parent.Items.Restrict(
+            build_sender_filter(sender_names, message.Subject)
+        )
+        return any(item.EntryID == entry_id for item in items)
+    except Exception as e:
+        logging.error(f"보낸 사람 필터 확인 실패, SenderName 직접 비교로 대체합니다: {e}")
+        try:
+            return message.SenderName in sender_names
+        except Exception as e2:
+            logging.error(f"SenderName 확인 실패: {e2}")
+            return False
+
+
 def _extract_message_info(message):
     """이메일 제목에서 날짜, 시간 ID, ref 번호, 이름을 추출합니다.
 
@@ -253,16 +300,13 @@ def save_attachments(outlook):
         outlook: Outlook MAPI 네임스페이스 인스턴스 (개선 #8: 전역 변수 대신 인자로 전달)
     """
     inbox = outlook.GetDefaultFolder(6)
+    # SenderName을 직접 읽으면 Outlook 보안 경고가 뜨므로 Restrict 필터로 보낸 사람을 거른다.
     # 수정 #2: list()로 스냅샷을 찍어 순회 중 Items 변경으로 인한 누락/중복 방지
-    messages = list(inbox.Items)
+    messages = list(inbox.Items.Restrict(build_sender_filter(DELEGATION_SENDERS)))
     attach_list = []
 
     for message in messages:
-        if (
-            (message.SenderName == "DoNotReply")
-            and ("위임" in message.Subject)
-            and (message.Attachments.Count != 0)
-        ):
+        if ("위임" in message.Subject) and (message.Attachments.Count != 0):
             _save_attachments_for_message(message, attach_list)
 
     return attach_list
@@ -399,10 +443,11 @@ class Handler_Class:
         for ID in receivedItemsIDs.split(","):
             message = Handler_Class.outlook.Session.GetItemFromID(ID)
 
+            # 보낸 사람 판정(sender_matches)은 비용이 있으므로 제목/첨부 조건을 먼저 확인
             if (
-                (message.SenderName == "DoNotReply")
-                and ("위임" in message.Subject)
+                ("위임" in message.Subject)
                 and (message.Attachments.Count != 0)
+                and sender_matches(message, DELEGATION_SENDERS)
             ):
                 # 수정 #1: attach_list를 넘겨 저장 결과를 받고 QTableWidget에 항목 추가
                 new_items = []
@@ -418,9 +463,9 @@ class Handler_Class:
             name = names[0][2:]
 
             if (
-                (message.SenderName in ["DoNotReply", "Yong-Sok SHIN [신용석]"])
-                and ("위임" in message.Subject)
+                ("위임" in message.Subject)
                 and (name in ["이여름", "한송희"])
+                and sender_matches(message, CALENDAR_SENDERS)
             ):
                 if "거절결정서" in message.Subject:
                     rejection_type = "FR"
