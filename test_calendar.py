@@ -7,6 +7,7 @@
   - ref_num_key 정규식 패턴
 """
 
+import logging
 import os
 import sys
 import unittest
@@ -22,6 +23,9 @@ sys.modules["PySide6"] = MagicMock()
 sys.modules["PySide6.QtWidgets"] = MagicMock()
 sys.modules["PySide6.QtGui"] = MagicMock()
 sys.modules["PySide6.QtCore"] = MagicMock()
+
+# main 의 logging.basicConfig(filename='app.log') 가 걸리지 않게 — 테스트가 실제 앱 로그에 쓰지 않는다
+logging.getLogger().addHandler(logging.NullHandler())
 
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
@@ -47,6 +51,9 @@ class MockCreationTime:
 
     def date(self):
         return self._dt.date()
+
+    def __lt__(self, other):  # pywintypes.datetime 처럼 정렬할 수 있게
+        return self._dt < other._dt
 
     @property
     def year(self):   return self._dt.year
@@ -920,6 +927,185 @@ class TestKipris(unittest.TestCase):
     def test_appln_number(self):
         self.assertEqual(kipris.appln_number("10-2025-7000694"), "1020257000694")
         self.assertEqual(kipris.appln_number("10-2025-70"), "")
+
+
+OA_SUBJECT = "[위임] PA-2T8084; 한송희(고객지원팀-책임); OA [서 2026-10-01]; 2610010001"
+FR_SUBJECT = "[위임] PA-2T9001; 이여름(팀-담당); 거절결정서 [서 2026-10-05]; 2610050001"
+
+
+class TestBuildSchedule(unittest.TestCase):
+    """위임 메일 한 통의 일정 계산 (등록 전)"""
+
+    RECEIVED = date(2026, 10, 16)
+    TODAY = date(2026, 10, 16)
+
+    def setUp(self):
+        patcher = patch.dict(main.config, {"applicant_abbr": {}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _build(self, subject, kind, cache=None):
+        return main.build_schedule(subject, self.RECEIVED, kind, cache or {}, self.TODAY)
+
+    def _days(self, plan):
+        return [d for _g, _s, d in plan["items"]]
+
+    def test_no_ref(self):
+        self.assertIsNone(self._build("[위임] 한송희(팀); OA", "OA"))
+
+    def test_oa_kipris(self):
+        cache = {"PA-2T8084|의견제출통지서": {"doc_type": "의견제출통지서", "receipt_date": "2026-10-12",
+                                         "due_date": "2027-02-08", "app_no": "10-2025-7000694",
+                                         "applicant": "아우디 아게"}}
+        plan = self._build(OA_SUBJECT, "OA", cache)
+        self.assertEqual(self._days(plan), [date(2026, 10, 1), date(2027, 2, 8)])
+        self.assertEqual([s for _g, s, _d in plan["items"]], ["PA-2T8084_Comments_아우디", "PA-2T8084_의견서_아우디"])
+        self.assertFalse(plan["editable"])
+        self.assertEqual(plan["memo"], "출원인: 아우디 아게\n출원번호: 10-2025-7000694")
+
+    def test_oa_formula_editable(self):
+        plan = self._build(OA_SUBJECT, "OA")
+        self.assertEqual(self._days(plan), [date(2026, 10, 1), date(2027, 1, 21)])  # 10/1 + 4개월 - 11일
+        self.assertTrue(plan["editable"])
+        self.assertEqual(plan["memo"], "")
+
+    def test_oa_no_date_editable_with_notice(self):
+        plan = self._build("[위임] PA-2T8084; 한송희(팀); OA; 001", "OA")
+        self.assertEqual(self._days(plan), [self.RECEIVED, self.RECEIVED])
+        self.assertTrue(plan["editable"])
+        self.assertIn("통지일이 없어", plan["source_text"])
+
+    def test_fr_no_date_uses_received_plus_3_months(self):
+        """제목에 날짜가 없어도 FR 기한은 수신일 + 3개월 (예전에는 수신일 그대로 등록됐다)"""
+        plan = self._build("[위임] PA-2T9001; 이여름(팀); 거절결정서; 001", "FR")
+        self.assertEqual(self._days(plan), [self.RECEIVED, date(2027, 1, 16)])
+        self.assertFalse(plan["editable"])
+        self.assertIn("수신일", plan["source_text"])
+
+    def test_fr_uses_receipt_date_and_reexam(self):
+        cache = {"PA-2T9001|거절결정서": {"doc_type": "거절결정서", "receipt_date": "2026-10-06", "reexam": True}}
+        plan = self._build(FR_SUBJECT, "FR", cache)
+        self.assertEqual(self._days(plan), [date(2026, 10, 5), date(2027, 1, 6)])
+        self.assertEqual(plan["items"][1][1], "PA-2T9001_거결불")
+        self.assertEqual(plan["warning"], "")
+        self.assertIn("접수일 2026-10-06", plan["source_text"])
+
+    def test_fr_stale_case_ignored(self):
+        """지난 거절결정의 기록(재심사 아님)은 쓰지 않는다 — 경고를 낸다"""
+        cache = {"PA-2T9001|거절결정서": {"doc_type": "거절결정서", "receipt_date": "2026-05-01", "reexam": False,
+                                       "applicant": "아우디 아게"}}
+        plan = self._build(FR_SUBJECT, "FR", cache)
+        self.assertEqual(plan["items"][1][1], "PA-2T9001_재심사_아우디")
+        self.assertIn("_거결불", plan["warning"])
+        self.assertEqual(self._days(plan)[1], date(2027, 1, 16))  # 수신일 기준
+
+    def test_recent_case_bounds(self):
+        received = date(2026, 10, 16)
+        ok = lambda d: main.recent_case({"receipt_date": d}, received) is not None
+        self.assertTrue(ok("2026-08-17"))   # 60일 전
+        self.assertFalse(ok("2026-08-16"))  # 61일 전
+        self.assertTrue(ok("2026-10-19"))   # 3일 뒤
+        self.assertFalse(ok("2026-10-20"))
+        self.assertIsNone(main.recent_case(None, received))
+        self.assertIsNone(main.recent_case({"receipt_date": ""}, received))
+
+
+class TestCalendarState(unittest.TestCase):
+    """등록 기록 — 실패 일정 다시 시도, 처리한 위임 메일, 시작할 때 스캔"""
+
+    ITEMS = [("Comments", "PA-2T8084_Comments", date(2026, 10, 1)),
+             ("Action", "PA-2T8084_의견서", date(2027, 2, 8))]
+    NAMES = ["Mail", "No_Instructions"]
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        for name, value in (("CALENDAR_STATE_FILE", "calendar_state.json"), ("CASE_CACHE_FILE", "case_cache.json")):
+            patcher = patch.object(main, name, os.path.join(self.tmpdir.name, value))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.dict(main.config, {"naver_calendars": {"Mail": "Mail", "No_Instructions": "No_Instructions"},
+                                           "applicant_abbr": {}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _selected(self):
+        return [(0, self.ITEMS[0][2]), (1, self.ITEMS[1][2])]
+
+    def test_failure_pending_then_retry_clears(self):
+        naver = MagicMock()
+        naver.add_all_day.side_effect = [True, naver_cal.NaverError("연결 끊김")]
+        main.register_and_track("PA-2T8084", self.NAMES, self.ITEMS, self._selected(), naver, "메모")
+        pending = main.load_calendar_state()["pending"]
+        self.assertEqual([(p["subject"], p["day"], p["memo"]) for p in pending],
+                         [("PA-2T8084_의견서", "2027-02-08", "메모")])
+
+        naver = MagicMock()
+        naver.add_all_day.return_value = True
+        rows = main.retry_pending(naver)
+        self.assertEqual(rows, [("PA-2T8084", "PA-2T8084_의견서", date(2027, 2, 8), main.STATUS_ADDED)])
+        naver.add_all_day.assert_called_once_with("No_Instructions", "PA-2T8084_의견서", date(2027, 2, 8), "메모")
+        self.assertEqual(main.load_calendar_state()["pending"], [])
+
+    def test_retry_keeps_still_failing(self):
+        naver = MagicMock()
+        naver.add_all_day.side_effect = naver_cal.NaverError("연결 끊김")
+        main.register_and_track("PA-2T8084", self.NAMES, self.ITEMS, self._selected(), naver)
+        rows = main.retry_pending(naver)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(main.load_calendar_state()["pending"]), 2)
+
+    def test_dialog_retry_success_clears_pending(self):
+        naver = MagicMock()
+        naver.add_all_day.side_effect = [True, naver_cal.NaverError("연결 끊김"), True]
+        main.register_and_track("PA-2T8084", self.NAMES, self.ITEMS, self._selected(), naver)
+        main.register_and_track("PA-2T8084", self.NAMES, self.ITEMS, [(1, self.ITEMS[1][2])], naver)
+        self.assertEqual(main.load_calendar_state()["pending"], [])
+
+    def test_done_pruned_after_30_days(self):
+        main.mark_done("old", today=date(2026, 9, 1))
+        main.mark_done("new", today=date(2026, 10, 16))
+        self.assertEqual(set(main.load_calendar_state()["done"]), {"new"})
+
+    def _outlook(self, *messages):
+        outlook = MagicMock()
+        outlook.GetDefaultFolder.return_value.Items.Restrict.return_value = list(messages)
+        return outlook
+
+    def _delegation(self, entry_id, subject=OA_SUBJECT):
+        message = make_mock_message(subject, date.today().year, date.today().month, date.today().day)
+        message.EntryID = entry_id
+        return message
+
+    def test_first_run_only_records(self):
+        outlook = self._outlook(self._delegation("A"), self._delegation("B"))
+        with patch.object(main, "is_calendar_delegation", return_value=True), \
+                patch.object(main, "register_delegation") as reg:
+            self.assertEqual(main.scan_delegations(outlook), [])
+        reg.assert_not_called()
+        self.assertEqual(set(main.load_calendar_state()["done"]), {"A", "B"})
+
+    def test_scan_registers_only_new(self):
+        main.mark_done("A")
+        outlook = self._outlook(self._delegation("A"), self._delegation("B"))
+        row = ("PA-2T8084", "PA-2T8084_Comments", date(2026, 10, 1), main.STATUS_ADDED)
+        with patch.object(main, "is_calendar_delegation", return_value=True), \
+                patch.object(main, "register_delegation", return_value=[row]) as reg:
+            self.assertEqual(main.scan_delegations(outlook), [row])
+        reg.assert_called_once()
+        self.assertEqual(reg.call_args.args[0].EntryID, "B")
+        self.assertEqual(reg.call_args.kwargs, {"always_show": False})
+
+    def test_register_delegation_without_dialog_records_done(self):
+        """시작할 때 스캔: 날짜를 고칠 필요 없는 메일은 창 없이 등록하고 처리 기록을 남긴다"""
+        message = self._delegation("C", "[위임] PA-2T9001; 이여름(팀); 거절결정서 [서 2026-10-05]; 001")
+        with patch.object(naver_cal, "Session") as session_cls, patch.object(main, "ScheduleDialog") as dlg:
+            session_cls.return_value.add_all_day.return_value = True
+            rows = main.register_delegation(message, always_show=False)
+        dlg.assert_not_called()
+        self.assertEqual([r[3] for r in rows], [main.STATUS_ADDED, main.STATUS_ADDED])
+        self.assertIn("C", main.load_calendar_state()["done"])
 
 
 if __name__ == "__main__":

@@ -591,6 +591,91 @@ def resolve_oa_dates(mail_date, fallback_date, case, today):
     return due_date, "KIPRIS", ""
 
 
+CASE_RECENT_DAYS = 60   # 예고 메일 접수일이 위임 메일보다 이만큼 넘게 앞서면 지난 통지서의 기록으로 본다
+CASE_AHEAD_DAYS = 3
+
+
+def recent_case(case, received):
+    """예고 메일 기록이 이번 위임 메일의 것이면 그대로, 지난 통지서의 것이면 None."""
+    try:
+        receipt = date.fromisoformat((case or {}).get("receipt_date") or "")
+    except ValueError:
+        return None
+    gap = (received - receipt).days
+    return case if -CASE_AHEAD_DAYS <= gap <= CASE_RECENT_DAYS else None
+
+
+def case_memo(case):
+    """일정 설명칸 — 출원인·출원번호 가운데 있는 것만."""
+    case = case or {}
+    lines = []
+    if squash(case.get("applicant")):
+        lines.append(f"출원인: {squash(case.get('applicant'))}")
+    if case.get("app_no"):
+        lines.append(f"출원번호: {case['app_no']}")
+    return "\n".join(lines)
+
+
+def build_schedule(subject, received, rejection_type, cache, today):
+    """위임 메일 한 통의 Comments·Action 일정을 정합니다. 등록은 하지 않습니다.
+
+    subject: 메일 제목, received: 메일 수신일(date), cache: 예고 메일 사건 캐시.
+    반환값: dict(ref, items, folder_names, memo, doc_label, source_text, warning, editable). Ref 가 없으면 None.
+    """
+    ref_nums = ref_num_key.findall(subject)
+    if not ref_nums:
+        return None
+    ref_num = ref_nums[0]
+
+    # 예고 메일 때 저장한 사건 정보 (KIPRIS 마감기한·재심사 여부·접수일·출원인·출원번호)
+    case = find_case(cache, ref_num, OA_DOC_TYPE if rejection_type == "OA" else FR_DOC_TYPE)
+
+    # 제목의 통지일 「[서 2024-12-23]」 — Comments 일정 날짜. 없으면 수신일
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", subject)
+    notice_date = datetime.strptime(match.group(1), "%Y-%m-%d").date() if match else None
+    target_date = notice_date or received
+    warning = ""
+
+    if rejection_type == "OA":
+        subj_action = f"{ref_num}_의견서"
+        doc_label = "의견제출통지서 (OA)"
+        # 예고 메일 때 저장한 KIPRIS 마감기한을 쓴다. 없으면 통지일로 계산한 값(계산식).
+        fallback = notice_date + relativedelta(months=4) - timedelta(days=11) if notice_date else received
+        response_date, action_source, warning = resolve_oa_dates(notice_date, fallback, case, today)
+        if action_source == "KIPRIS":
+            source_text = "청서류 기한: KIPRIS 마감기한 사용"
+        elif notice_date:
+            source_text = "⚠ KIPRIS 마감기한 사용 불가 → 계산식 적용 (날짜를 확인하세요)"
+        else:
+            source_text = "⚠ 제목에 통지일이 없어 기한을 계산하지 못했습니다 — 날짜를 입력하세요"
+        editable = dates_editable(rejection_type, action_source)
+    else:
+        fresh = recent_case(case, received)  # 지난 거절결정의 기록(재심사 여부·접수일)은 쓰지 않는다
+        subj_action, doc_label, fr_source, warning = fr_action(ref_num, fresh)
+        try:
+            base, base_text = date.fromisoformat(fresh["receipt_date"]), "접수일"
+        except (TypeError, KeyError, ValueError):
+            base, base_text = received, "수신일"
+        response_date = base + relativedelta(months=3)
+        source_text = f"{fr_source} · 청서류 기한: {base_text} {base.isoformat()} + 3개월"
+        editable = False
+
+    applicant = (case or {}).get("applicant", "")
+    return {
+        "ref": ref_num,
+        "items": [
+            ("Comments 일정 (네이버: Mail)", with_applicant(f"{ref_num}_Comments", applicant), target_date),
+            ("Action 일정 (네이버: No_Instructions)", with_applicant(subj_action, applicant), response_date),
+        ],
+        "folder_names": ["Mail", "No_Instructions"],
+        "memo": case_memo(case),
+        "doc_label": doc_label,
+        "source_text": source_text,
+        "warning": warning,
+        "editable": editable,
+    }
+
+
 def dates_editable(rejection_type, action_source):
     """날짜를 고칠 수 있는가 — OA 에서 KIPRIS 마감기한을 쓸 수 없을 때만."""
     return rejection_type == "OA" and action_source != "KIPRIS"
@@ -623,6 +708,89 @@ def register_items(folder_names, items, selected, naver, memo=""):
 def failed_indices(results):
     """「오류」로 끝난 일정의 index — [다시 시도] 대상."""
     return sorted(i for i, status in results.items() if status.startswith("오류"))
+
+
+# ── 등록 기록 (처리한 위임 메일·등록 실패 일정) ──────────────────────────
+CALENDAR_STATE_FILE = "calendar_state.json"
+CALENDAR_DONE_KEEP_DAYS = 30
+DELEGATION_SCAN_DAYS = 14
+
+
+def load_calendar_state():
+    """{"done": {EntryID: 처리일}, "pending": [실패 일정]}. 파일이 없으면 None (처음 실행)."""
+    if not os.path.exists(CALENDAR_STATE_FILE):
+        return None
+    try:
+        with open(CALENDAR_STATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        logging.error(f"등록 기록 로드 실패: {e}")
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    return {"done": dict(data.get("done") or {}), "pending": list(data.get("pending") or [])}
+
+
+def save_calendar_state(state, today=None):
+    """등록 기록을 저장합니다. 처리한 지 CALENDAR_DONE_KEEP_DAYS 가 지난 메일 기록은 지웁니다."""
+    cutoff = ((today or date.today()) - timedelta(days=CALENDAR_DONE_KEEP_DAYS)).isoformat()
+    data = {"done": {k: v for k, v in state["done"].items() if v >= cutoff}, "pending": state["pending"]}
+    try:
+        tmp = CALENDAR_STATE_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CALENDAR_STATE_FILE)
+    except Exception as e:
+        logging.error(f"등록 기록 저장 실패: {e}")
+
+
+def _pending_key(p):
+    return (p["folder"], p["subject"], p["day"])
+
+
+def track_results(ref, folder_names, items, results, days, memo=""):
+    """등록 결과를 기록에 반영 — 「오류」 일정은 pending 에 넣고, 등록됐거나 이미 있던 일정은 뺀다."""
+    state = load_calendar_state() or {"done": {}, "pending": []}
+    pending = {_pending_key(p): p for p in state["pending"]}
+    for i, status in results.items():
+        p = {"ref": ref, "folder": folder_names[i], "subject": items[i][1], "day": days[i].isoformat(), "memo": memo}
+        if status.startswith("오류"):
+            pending[_pending_key(p)] = p
+        else:
+            pending.pop(_pending_key(p), None)
+    state["pending"] = list(pending.values())
+    save_calendar_state(state)
+
+
+def register_and_track(ref, folder_names, items, selected, naver, memo=""):
+    """register_items + 결과를 등록 기록에 반영. 반환값: {index: 결과}"""
+    results = register_items(folder_names, items, selected, naver, memo)
+    track_results(ref, folder_names, items, results, dict(selected), memo)
+    return results
+
+
+def mark_done(entry_id, today=None):
+    """위임 메일 하나를 처리했다고 기록 — 다음 시작 때 다시 등록하지 않는다."""
+    state = load_calendar_state() or {"done": {}, "pending": []}
+    state["done"][entry_id] = (today or date.today()).isoformat()
+    save_calendar_state(state, today)
+
+
+def retry_pending(naver):
+    """등록에 실패했던 일정을 다시 등록합니다. 반환값: [(Ref, 제목, 날짜, 결과), ...]"""
+    state = load_calendar_state()
+    if not state or not state["pending"]:
+        return []
+    rows, still = [], []
+    for p in state["pending"]:
+        day = date.fromisoformat(p["day"])
+        status = _register_naver(naver, p["folder"], p["subject"], day, p.get("memo", ""))
+        rows.append((p["ref"], p["subject"], day, status))
+        if status.startswith("오류"):
+            still.append(p)
+    state = load_calendar_state() or {"done": {}, "pending": []}
+    state["pending"] = still
+    save_calendar_state(state)
+    return rows
 
 
 class ScheduleDialog(qtw.QDialog):
@@ -768,6 +936,146 @@ class ScheduleDialog(qtw.QDialog):
         self.btn_close.setVisible(True)
 
 
+CALENDAR_ASSIGNEES = ["이여름", "한송희"]  # 이 담당자 앞으로 온 위임 메일만 일정 등록
+
+
+def is_calendar_delegation(message):
+    """일정을 등록할 위임 메일인가 — 제목 「위임」, 담당자 이름, 보낸 사람."""
+    if "위임" not in message.Subject:
+        return False
+    names = name_key.findall(message.Subject)
+    if not names or names[0][2:] not in CALENDAR_ASSIGNEES:
+        return False
+    return sender_matches(message, CALENDAR_SENDERS)
+
+
+def rejection_type_of(message):
+    return "FR" if "거절결정서" in message.Subject else "OA"
+
+
+def register_delegation(message, always_show=True):
+    """위임 메일 한 통의 일정을 등록하고 기록합니다.
+
+    날짜를 고칠 수 있는 경우(OA + KIPRIS 사용 불가)는 늘 알림창에서 확인받습니다.
+    always_show=False 면(시작할 때 스캔) 바로 등록한 결과는 창 없이 돌려줍니다.
+    반환값: [(Ref, 제목, 날짜, 결과), ...]
+    """
+    rejection_type = rejection_type_of(message)
+    plan = build_schedule(message.Subject, message.CreationTime.date(), rejection_type,
+                          load_case_cache(), date.today())
+    if plan is None:
+        logging.warning(f"Ref 번호를 찾을 수 없습니다: {message.Subject}")
+        mark_done(message.EntryID)
+        return []
+    ref, items, folder_names = plan["ref"], plan["items"], plan["folder_names"]
+    logging.info(f"일정 계산: {ref} {rejection_type} → {[(s, d.isoformat()) for _g, s, d in items]} "
+                 f"({plan['source_text']}) {plan['warning']}")
+
+    def register(selected):
+        return register_and_track(ref, folder_names, items, selected, naver_cal.Session(), plan["memo"])
+
+    results = None if plan["editable"] else register([(0, items[0][2]), (1, items[1][2])])
+    rows = []
+    if plan["editable"] or always_show:
+        dialog = ScheduleDialog(
+            parent=qtw.QApplication.activeWindow(),
+            ref_num=ref,
+            doc_label=plan["doc_label"],
+            items=items,
+            source_text=plan["source_text"],
+            warning=plan["warning"],
+            editable=plan["editable"],
+            register=register,
+            results=results,
+        )
+        dialog.exec()
+        if plan["editable"] and not dialog.registered:
+            logging.info(f"캘린더 일정 등록이 사용자에 의해 취소되었습니다. Ref: {ref}")
+    else:
+        rows = [(ref, items[i][1], items[i][2], status) for i, status in sorted(results.items())]
+    mark_done(message.EntryID)
+    return rows
+
+
+def scan_delegations(outlook, days=DELEGATION_SCAN_DAYS):
+    """앱이 꺼져 있던 동안 받은 위임 메일의 일정을 등록합니다 (최근 days 일). 반환값: 요약 행 목록.
+
+    처음 실행할 때(등록 기록 파일 없음)는 이미 등록했을 수 있으니 지금 있는 메일을 처리한 것으로만 기록합니다.
+    """
+    inbox = outlook.GetDefaultFolder(6)
+    query = (
+        build_sender_filter(CALENDAR_SENDERS)
+        + f" AND {_DASL_SUBJECT} LIKE {_dasl_str('%위임%')}"
+    )
+    since = date.today() - timedelta(days=days)
+    messages = sorted(
+        (m for m in inbox.Items.Restrict(query) if m.CreationTime.date() >= since and is_calendar_delegation(m)),
+        key=lambda m: m.CreationTime,
+    )
+    state = load_calendar_state()
+    if state is None:
+        state = {"done": {m.EntryID: date.today().isoformat() for m in messages}, "pending": []}
+        save_calendar_state(state)
+        logging.info(f"등록 기록을 새로 만들었습니다 — 위임 메일 {len(messages)}통은 처리한 것으로 봅니다.")
+        return []
+    rows = []
+    for message in messages:
+        if message.EntryID in state["done"]:
+            continue
+        try:
+            rows += register_delegation(message, always_show=False)
+        except Exception as e:
+            logging.error(f"위임 메일 일정 등록 실패: {message.Subject} — {e}", exc_info=True)
+    return rows
+
+
+class StartupSummaryDialog(qtw.QDialog):
+    """앱을 시작할 때 다시 등록한 일정(실패 일정·놓친 위임 메일)의 결과."""
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("캘린더 등록 — 시작할 때 처리한 일정")
+        self.resize(560, 300)
+        layout = qtw.QVBoxLayout(self)
+        layout.addWidget(qtw.QLabel("앱이 꺼져 있던 동안 받은 위임 메일과 지난번 실패한 일정을 등록했습니다."))
+        table = qtw.QTableWidget(len(rows), 4)
+        table.setHorizontalHeaderLabels(["Ref", "일정 제목", "날짜", "결과"])
+        table.horizontalHeader().setSectionResizeMode(1, qtw.QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(qtw.QAbstractItemView.NoEditTriggers)
+        for r, (ref, subject, day, status) in enumerate(rows):
+            for c, text in enumerate((ref, subject, day.isoformat(), status)):
+                table.setItem(r, c, qtw.QTableWidgetItem(text))
+            table.item(r, 3).setForeground(qtg.QColor(ScheduleDialog._status_color(status)))
+        layout.addWidget(table)
+        if failed_indices(dict(enumerate(s for *_x, s in rows))):
+            note = qtw.QLabel("실패한 일정은 다음에 앱을 시작할 때 다시 등록합니다.")
+            note.setStyleSheet("color: #8A5300;")
+            layout.addWidget(note)
+        close_btn = qtw.QPushButton("닫기")
+        close_btn.clicked.connect(self.accept)
+        btn_box = qtw.QHBoxLayout()
+        btn_box.addStretch()
+        btn_box.addWidget(close_btn)
+        layout.addLayout(btn_box)
+
+
+def catch_up_calendar(outlook):
+    """시작할 때: 실패했던 일정을 다시 등록하고, 놓친 위임 메일의 일정을 등록한 뒤 결과를 요약해 보여 줍니다."""
+    rows = []
+    try:
+        rows += retry_pending(naver_cal.Session())
+    except Exception as e:
+        logging.error(f"실패 일정 다시 등록 실패: {e}", exc_info=True)
+    try:
+        rows += scan_delegations(outlook)
+    except Exception as e:
+        logging.error(f"위임 메일 스캔 실패: {e}", exc_info=True)
+    if any(status != STATUS_DUPLICATE for *_x, status in rows):
+        StartupSummaryDialog(rows, qtw.QApplication.activeWindow()).exec()
+    return rows
+
+
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
 class Handler_Class:
     # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
@@ -800,113 +1108,11 @@ class Handler_Class:
                     logging.error(f"예고 메일 처리 실패: {e}", exc_info=True)
                 continue
 
-            # 이름 추출 - 조건 체크 전 실패 가능성 처리
-            names = name_key.findall(message.Subject)
-            if not names:
-                continue
-            name = names[0][2:]
-
-            if (
-                ("위임" in message.Subject)
-                and (name in ["이여름", "한송희"])
-                and sender_matches(message, CALENDAR_SENDERS)
-            ):
-                if "거절결정서" in message.Subject:
-                    rejection_type = "FR"
-                else:
-                    rejection_type = "OA"
-
-                self.add_calendar_event(message, rejection_type)
-
-    def add_calendar_event(self, message, rejection_type):
-        """위임 메일의 Comments·Action 일정을 네이버 캘린더(Mail·No_Instructions)에 등록한다."""
-        # Ref 번호 추출
-        ref_nums = ref_num_key.findall(message.Subject)
-        if not ref_nums:
-            logging.warning(f"Ref 번호를 찾을 수 없습니다: {message.Subject}")
-            return
-        ref_num = ref_nums[0]
-        
-        subj_comments = f"{ref_num}_Comments"
-        # 예고 메일 때 저장한 사건 정보 (KIPRIS 마감기한·재심사 여부·출원인)
-        case = find_case(load_case_cache(), ref_num, OA_DOC_TYPE if rejection_type == "OA" else FR_DOC_TYPE)
-        if rejection_type == "OA":
-            subj_action = f"{ref_num}_의견서"
-        else:
-            subj_action, fr_label, fr_source, fr_warning = fr_action(ref_num, case)
-        applicant = (case or {}).get("applicant", "")
-        subj_comments = with_applicant(subj_comments, applicant)
-        subj_action = with_applicant(subj_action, applicant)
-        memo = f"출원인: {squash(applicant)}" if squash(applicant) else ""
-
-        # 이메일 제목에서 날짜 추출
-        date_pattern = r"(\d{4}-\d{2}-\d{2})"
-        match = re.search(date_pattern, message.Subject)
-
-        target_date = None
-        response_date = None
-        action_source = ""
-        warning = ""
-
-        if match:
-            target_date_str = match.group(1)
-            target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
-
-            if rejection_type == "OA":
-                response_date = target_date + relativedelta(months=4) - timedelta(days=11)
-            else:
-                receipt_date = message.CreationTime.date()
-                response_date = receipt_date + relativedelta(months=3)
-        else:
-            target_date = message.CreationTime.date()
-            response_date = message.CreationTime.date()
-
-        if rejection_type == "OA":
-            # 예고 메일 때 저장한 KIPRIS 마감기한을 쓴다. 없으면 위에서 계산한 값(계산식) 그대로.
-            response_date, action_source, warning = resolve_oa_dates(
-                target_date, response_date, case, date.today()
-            )
-            logging.info(f"OA 청서류 기한: {ref_num} → {response_date} ({action_source}) {warning}")
-
-        items = [
-            ("Comments 일정 (네이버: Mail)", subj_comments, target_date),
-            ("Action 일정 (네이버: No_Instructions)", subj_action, response_date),
-        ]
-        folder_names = ["Mail", "No_Instructions"]
-
-        def register(selected):
-            return register_items(folder_names, items, selected, naver_cal.Session(), memo)
-
-        if rejection_type == "OA":
-            doc_label = "의견제출통지서 (OA)"
-            if action_source == "KIPRIS":
-                source_text = "청서류 기한: KIPRIS 마감기한 사용"
-            else:
-                source_text = "⚠ KIPRIS 마감기한 사용 불가 → 계산식 적용 (날짜를 확인하세요)"
-        else:
-            doc_label = fr_label
-            source_text = f"{fr_source} · 청서류 기한: 계산식 (수신일 + 3개월)"
-            warning = fr_warning
-
-        # 날짜를 고칠 수 없으면 바로 등록하고 결과를 알림창에 보여 준다.
-        # 고칠 수 있으면(OA + KIPRIS 사용 불가) 알림창에서 확인·수정한 뒤 [등록] — 결과는 같은 창에 표시.
-        editable = dates_editable(rejection_type, action_source)
-        results = None if editable else register([(0, target_date), (1, response_date)])
-
-        dialog = ScheduleDialog(
-            parent=qtw.QApplication.activeWindow(),
-            ref_num=ref_num,
-            doc_label=doc_label,
-            items=items,
-            source_text=source_text,
-            warning=warning,
-            editable=editable,
-            register=register,
-            results=results,
-        )
-        dialog.exec()
-        if editable and not dialog.registered:
-            logging.info(f"캘린더 일정 등록이 사용자에 의해 취소되었습니다. Ref: {ref_num}")
+            if is_calendar_delegation(message):
+                try:
+                    register_delegation(message)
+                except Exception as e:
+                    logging.error(f"위임 메일 일정 등록 실패: {message.Subject} — {e}", exc_info=True)
 
 
 class MainWin(qtw.QWidget):
@@ -1479,4 +1685,6 @@ if __name__ == "__main__":
     app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
+    # 창을 띄운 뒤: 실패했던 일정 다시 등록 + 꺼져 있던 동안 온 위임 메일 일정 등록 (예고 메일 스캔 다음)
+    qtc.QTimer.singleShot(0, lambda: catch_up_calendar(outlook_mapi))
     sys.exit(app.exec())
