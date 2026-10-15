@@ -7,6 +7,7 @@
   - ref_num_key 정규식 패턴
 """
 
+import os
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -24,6 +25,7 @@ sys.modules["PySide6.QtCore"] = MagicMock()
 
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
+import kipris  # noqa: E402
 import main  # noqa: E402  (mock 설정 후 import)
 from main import _extract_message_info, ref_num_key  # noqa: E402
 
@@ -69,7 +71,7 @@ def make_mock_message(subject, creation_year=2025, creation_month=1, creation_da
 
 
 # -----------------------------------------------------------------------
-# 날짜 계산 로직 (add_calendar_event 내부와 동일)
+# 날짜 계산 로직 (add_calendar_event 내부와 동일 — KIPRIS 값이 없을 때의 계산식)
 # -----------------------------------------------------------------------
 
 def calc_response_date(rejection_type, target_date, receipt_date):
@@ -246,7 +248,7 @@ class TestRefNumRegex(unittest.TestCase):
 
 
 class TestScheduleEditDialogLogic(unittest.TestCase):
-    """ScheduleEditDialog 및 날짜 수정 로직 단위 테스트"""
+    """ScheduleDialog 날짜 수정 흐름 단위 테스트"""
 
     def test_edited_dates_flow(self):
         """기본 계산된 날짜와 사용자가 다이얼로그에서 변경한 날짜의 흐름 검증"""
@@ -345,6 +347,222 @@ class TestSenderFilter(unittest.TestCase):
         restrict.assert_called_once_with(main.build_sender_filter(main.DELEGATION_SENDERS))
         save_one.assert_called_once()
         self.assertIs(save_one.call_args[0][0], delegated)
+
+
+PRENOTICE_BODY = (
+    "아래 사건의 담당자를 지정합니다.\r\n"
+    "20261012\t10-2025-7009898\tPA-T2K6640\t윤민우\t테크닙 에너지스 프랑스\t거절결정서\r\n"
+    "20261012\t10-2025-0070677\tTEL-20035KR-1\t이윤지\t도쿄엘렉트론가부시키가이샤\t거절결정서\r\n"
+    "20261012\t10-2025-7002565\tPA-T2K6503\t이예진\t누보 피그노네 에스알엘\t보정요구서\r\n"
+    "20261012\t10-2025-7002565\tPA-T2K6503\t이예진\t누보 피그노네 에스알엘\t보정요구서\r\n"
+    "20261012\t10-2025-7000694\tPA-2T8084\t신용석\t에어 프로덕츠 앤드 케미칼스, 인코오포레이티드\t의견제출통지서\r\n"
+)
+
+DUE_DATE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<response><header><successYN>Y</successYN><resultCode>00</resultCode><resultMsg>NORMAL SERVICE.</resultMsg></header>
+<body><items>
+<dueDateApplicationNoticeApplnoInfo><ApplicationNumber>1020200000001</ApplicationNumber>
+ <Mailingnumber>952020049798050</Mailingnumber><DocNm>의견제출통지서</DocNm><ExpirationDuedateDate>20200807</ExpirationDuedateDate>
+</dueDateApplicationNoticeApplnoInfo>
+<dueDateApplicationNoticeApplnoInfo><ApplicationNumber>1020200000001</ApplicationNumber>
+ <Mailingnumber>952020069827303</Mailingnumber><DocNm>최후의견제출통지서</DocNm><ExpirationDuedateDate>20201212</ExpirationDuedateDate>
+</dueDateApplicationNoticeApplnoInfo>
+<dueDateApplicationNoticeApplnoInfo><ApplicationNumber>1020200000001</ApplicationNumber>
+ <Mailingnumber>952020012159905</Mailingnumber><DocNm>의견제출통지서</DocNm><ExpirationDuedateDate>20200531</ExpirationDuedateDate>
+</dueDateApplicationNoticeApplnoInfo>
+</items></body></response>"""
+
+
+class TestPrenoticeRows(unittest.TestCase):
+    """예고 메일 본문 표 파싱"""
+
+    def test_only_assignee_rows(self):
+        rows = main.parse_prenotice_rows(PRENOTICE_BODY, "신용석")
+        self.assertEqual(rows, [{
+            "ref": "PA-2T8084",
+            "app_no": "10-2025-7000694",
+            "receipt_date": "2026-10-12",
+            "doc_type": "의견제출통지서",
+            "applicant": "에어 프로덕츠 앤드 케미칼스, 인코오포레이티드",
+        }])
+
+    def test_duplicate_rows_removed(self):
+        rows = main.parse_prenotice_rows(PRENOTICE_BODY, "이예진")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["doc_type"], "보정요구서")
+
+    def test_ref_normalized_like_subject(self):
+        """「TEL-20035KR-1」 → 위임 메일 제목과 같은 규칙으로 「TEL-20035」"""
+        rows = main.parse_prenotice_rows(PRENOTICE_BODY, "이윤지")
+        self.assertEqual(rows[0]["ref"], ref_num_key.findall("[위임] TEL-20035KR-1; ...")[0])
+
+    def test_cell_per_line_body(self):
+        """실제 Outlook Body: HTML 표의 칸마다 한 줄, 사이에 빈 줄"""
+        body = "\r\n\r\n".join(
+            cell for line in PRENOTICE_BODY.splitlines()[1:] for cell in line.split("\t")
+        )
+        self.assertEqual(main.parse_prenotice_rows(body, "신용석"),
+                         main.parse_prenotice_rows(PRENOTICE_BODY, "신용석"))
+        self.assertEqual(len(main.parse_prenotice_rows(body, "이예진")), 1)
+
+    def test_no_rows(self):
+        self.assertEqual(main.parse_prenotice_rows("본문 없음", "신용석"), [])
+        self.assertEqual(main.parse_prenotice_rows(None, "신용석"), [])
+
+
+class TestResolveOaDates(unittest.TestCase):
+    """OA 청서류 기한 결정 (KIPRIS 호출 없음)"""
+
+    MAIL = date(2026, 11, 20)
+    FALLBACK = date(2027, 3, 9)
+    TODAY = date(2026, 10, 15)
+
+    def test_kipris_due_used(self):
+        case = {"app_no": "10-2025-7000694", "due_date": "2027-02-08"}
+        self.assertEqual(main.resolve_oa_dates(self.MAIL, self.FALLBACK, case, self.TODAY),
+                         (date(2027, 2, 8), "KIPRIS", ""))
+
+    def test_no_case_uses_formula(self):
+        d, src, warn = main.resolve_oa_dates(self.MAIL, self.FALLBACK, None, self.TODAY)
+        self.assertEqual((d, src), (self.FALLBACK, "계산식"))
+        self.assertTrue(warn)
+
+    def test_missing_due_uses_formula(self):
+        case = {"app_no": "10-2025-7000694", "due_date": ""}
+        d, src, warn = main.resolve_oa_dates(self.MAIL, self.FALLBACK, case, self.TODAY)
+        self.assertEqual((d, src), (self.FALLBACK, "계산식"))
+        self.assertIn("10-2025-7000694", warn)
+
+    def test_due_before_today_ignored(self):
+        case = {"due_date": "2026-10-01"}
+        d, src, warn = main.resolve_oa_dates(self.MAIL, self.FALLBACK, case, self.TODAY)
+        self.assertEqual((d, src), (self.FALLBACK, "계산식"))
+        self.assertIn("2026-10-01", warn)
+
+    def test_due_not_after_mail_date_ignored(self):
+        case = {"due_date": "2026-11-20"}
+        d, src, _ = main.resolve_oa_dates(self.MAIL, self.FALLBACK, case, self.TODAY)
+        self.assertEqual((d, src), (self.FALLBACK, "계산식"))
+
+
+class TestFindOaCase(unittest.TestCase):
+
+    def test_latest_oa_entry_for_ref(self):
+        cache = {
+            "PA-2T8084|의견제출통지서": {"doc_type": "의견제출통지서", "receipt_date": "2026-03-02"},
+            "PA-2T8084|최후의견제출통지서": {"doc_type": "최후의견제출통지서", "receipt_date": "2026-10-12"},
+            "PA-2T8084|보정요구서": {"doc_type": "보정요구서", "receipt_date": "2026-11-01"},
+            "PA-2T8085|의견제출통지서": {"doc_type": "의견제출통지서", "receipt_date": "2026-12-01"},
+        }
+        self.assertEqual(main.find_oa_case(cache, "PA-2T8084")["receipt_date"], "2026-10-12")
+        self.assertIsNone(main.find_oa_case(cache, "PA-0000000"))
+
+
+class TestHandlePrenotice(unittest.TestCase):
+    """예고 메일 처리 — 캐시 저장, KIPRIS 1회 조회, 같은 메일 재처리 시 호출 안 함"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cache_patch = patch.object(main, "CASE_CACHE_FILE",
+                                        os.path.join(self.tmpdir.name, "case_cache.json"))
+        self.cache_patch.start()
+
+    def tearDown(self):
+        self.cache_patch.stop()
+        self.tmpdir.cleanup()
+
+    def _message(self):
+        message = make_mock_message("FW: 사건 담당자 지정", date.today().year,
+                                    date.today().month, date.today().day)
+        message.Body = PRENOTICE_BODY
+        return message
+
+    def test_stores_due_date_and_skips_repeat(self):
+        notices = [kipris.Notice("952026093034069", "의견제출통지서", "2027-02-08")]
+        with patch.object(kipris, "fetch_due_dates", return_value=notices) as fetch:
+            self.assertEqual(main.handle_prenotice(self._message()), 1)
+            self.assertEqual(main.handle_prenotice(self._message()), 0)
+        fetch.assert_called_once_with("10-2025-7000694")
+
+        case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
+        self.assertEqual(case["due_date"], "2027-02-08")
+        self.assertEqual(case["receipt_date"], "2026-10-12")
+
+    def test_kipris_failure_still_stores_app_no(self):
+        with patch.object(kipris, "fetch_due_dates", side_effect=kipris.KiprisError("키 없음")):
+            main.handle_prenotice(self._message())
+        case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
+        self.assertEqual((case["app_no"], case["due_date"]), ("10-2025-7000694", ""))
+
+    def test_missing_due_retried_on_next_prenotice_pass(self):
+        """지난번 조회가 실패한 행은 예고 메일을 다시 처리할 때 다시 조회한다"""
+        with patch.object(kipris, "fetch_due_dates", side_effect=kipris.KiprisError("연결 끊김")):
+            main.handle_prenotice(self._message())
+        notices = [kipris.Notice("952026093034069", "의견제출통지서", "2027-02-08")]
+        with patch.object(kipris, "fetch_due_dates", return_value=notices) as fetch:
+            self.assertEqual(main.handle_prenotice(self._message()), 1)
+        fetch.assert_called_once()
+        case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
+        self.assertEqual(case["due_date"], "2027-02-08")
+
+
+class TestScheduleRegistration(unittest.TestCase):
+    """알림창 날짜 편집 규칙과 일정 등록"""
+
+    def test_dates_editable_only_for_oa_without_kipris(self):
+        self.assertFalse(main.dates_editable("OA", "KIPRIS"))
+        self.assertTrue(main.dates_editable("OA", "계산식"))
+        self.assertFalse(main.dates_editable("FR", ""))
+
+    def test_register_adds_when_not_duplicate(self):
+        folder = MagicMock()
+        appointment = folder.Items.Add.return_value
+        with patch.object(main, "check_duplicate_appointment", return_value=False):
+            status = main._register_appointment(folder, "PA-2T8084_의견서", date(2027, 2, 8), "본문")
+        self.assertEqual(status, main.STATUS_ADDED)
+        self.assertEqual(appointment.Subject, "PA-2T8084_의견서")
+        self.assertTrue(appointment.AllDayEvent)
+        self.assertEqual(appointment.Start.date(), date(2027, 2, 8))
+        appointment.Save.assert_called_once()
+
+    def test_register_skips_duplicate(self):
+        folder = MagicMock()
+        with patch.object(main, "check_duplicate_appointment", return_value=True):
+            status = main._register_appointment(folder, "PA-2T8084_의견서", date(2027, 2, 8), "본문")
+        self.assertEqual(status, main.STATUS_DUPLICATE)
+        folder.Items.Add.assert_not_called()
+
+
+class TestKipris(unittest.TestCase):
+    """KIPRIS 마감기한 응답 해석 (CPProject 응답 모양)"""
+
+    def test_parse_and_pick_latest(self):
+        notices = kipris.parse_due_dates(DUE_DATE_XML)
+        self.assertEqual(len(notices), 3)
+        picked = kipris.pick_oa_due(notices, "의견제출통지서")
+        # 「최후의견제출통지서」도 「의견제출통지서」를 포함 — 발송번호가 가장 큰 것
+        self.assertEqual((picked.send_number, picked.due_date), ("952020069827303", "2020-12-12"))
+
+    def test_pick_none(self):
+        self.assertIsNone(kipris.pick_oa_due(kipris.parse_due_dates(DUE_DATE_XML), "거절결정서"))
+        self.assertIsNone(kipris.pick_oa_due([], "의견제출통지서"))
+
+    def test_result_codes_raise(self):
+        for code, msg in (("30", "SERVICE_KEY_IS_NOT_REGISTERED_ERROR"),
+                          ("31", "DEADLINE_HAS_EXPIRED_ERROR"),
+                          ("101", ""), ("11", "OTHER")):
+            xml = f"<response><header><resultCode>{code}</resultCode><resultMsg>{msg}</resultMsg></header></response>"
+            with self.subTest(code=code), self.assertRaises(kipris.KiprisError):
+                kipris.parse_due_dates(xml)
+
+    def test_not_xml_raises(self):
+        with self.assertRaises(kipris.KiprisError):
+            kipris.parse_due_dates("<html>code400")
+
+    def test_appln_number(self):
+        self.assertEqual(kipris.appln_number("10-2025-7000694"), "1020257000694")
+        self.assertEqual(kipris.appln_number("10-2025-70"), "")
 
 
 if __name__ == "__main__":

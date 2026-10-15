@@ -5,7 +5,7 @@ import json
 import logging
 import shutil
 import stat
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from time import sleep
 
 import pytz
@@ -31,6 +31,8 @@ from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
 from PySide6 import QtSvg as qts
 
+import kipris
+
 # 로깅 설정
 logging.basicConfig(
     filename='app.log',
@@ -48,7 +50,8 @@ name_key = re.compile(r"; [ㄱ-ㅎ|ㅏ-ㅣ|가-힣]+(?=\()")
 CONFIG_FILE = "settings.json"
 DEFAULT_CONFIG = {
     "parent_path": r"C:/Dropbox/1_Project/Tasks",
-    "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review"
+    "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review",
+    "prenotice_assignee": "신용석",  # 예고 메일 표에서 읽을 담당자
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -193,6 +196,8 @@ def safe_remove_path(path, retries=5, delay=0.1):
 # Items.Restrict 필터는 보호 대상이 아니므로, 보낸 사람 판정은 필터로 처리한다.
 DELEGATION_SENDERS = ["DoNotReply"]  # 위임 메일 첨부 저장 대상 보낸 사람
 CALENDAR_SENDERS = ["DoNotReply", "Yong-Sok SHIN [신용석]"]  # 캘린더 등록 대상 보낸 사람
+PRENOTICE_SENDERS = ["Chang-Kyu KIM [김창규]"]  # 예고 메일(사건 담당자 지정) 보낸 사람
+PRENOTICE_SUBJECT = "사건 담당자 지정"
 
 _DASL_FROMNAME = '"urn:schemas:httpmail:fromname"'
 _DASL_SUBJECT = '"urn:schemas:httpmail:subject"'
@@ -326,110 +331,329 @@ def check_duplicate_appointment(folder, subject, start_date):
     return False
 
 
-class ScheduleEditDialog(qtw.QDialog):
-    """캘린더 일정 자동 등록 시 날짜 확인 및 수정을 위한 모달 다이얼로그"""
+# ── 예고 메일(사건 담당자 지정) ─────────────────────────────────────────
+# 본문 표 한 행: 접수일 / 출원번호 / Ref / 담당자 / 출원인 / 문서종류
+# 예) 20261012	10-2025-7000694	PA-2T8084	신용석	에어 프로덕츠 앤드 케미칼스, 인코오포레이티드	의견제출통지서
+# Outlook 의 MailItem.Body 는 HTML 표를 칸마다 한 줄(사이에 빈 줄)로 풀어 준다. 탭으로 이은 한 줄도 받는다.
+_RECEIPT_CELL = re.compile(r"\d{8}")
+_APP_NO_CELL = re.compile(r"\d{2}-\d{4}-\d{7}")
+_PRENOTICE_CELLS = 6
+OA_DOC_TYPE = "의견제출통지서"  # 「최후의견제출통지서」도 이 글자를 포함한다
+CASE_CACHE_FILE = "case_cache.json"
+CASE_CACHE_KEEP_DAYS = 183
+PRENOTICE_SCAN_DAYS = 14
 
-    def __init__(self, parent=None, ref_num="", subj_comments="", target_date=None, subj_action="", response_date=None):
+
+def parse_prenotice_rows(body, assignee):
+    """예고 메일 본문 표에서 담당자가 assignee 인 행만 읽습니다(중복 행 제거).
+
+    반환값: [{"ref", "app_no", "receipt_date"(YYYY-MM-DD), "doc_type", "applicant"}, ...]
+    """
+    # 빈 칸을 버리고 칸을 한 줄로 늘어놓는다 — 「접수일, 출원번호」 가 이어지는 곳이 한 행의 시작
+    cells = [c.strip() for line in (body or "").splitlines() for c in line.split("\t") if c.strip()]
+    rows, seen = [], set()
+    for i in range(len(cells) - _PRENOTICE_CELLS + 1):
+        if not (_RECEIPT_CELL.fullmatch(cells[i]) and _APP_NO_CELL.fullmatch(cells[i + 1])):
+            continue
+        receipt, app_no, ref_token, name, applicant, doc_type = cells[i:i + _PRENOTICE_CELLS]
+        if name != assignee:
+            continue
+        # 위임 메일 제목과 같은 규칙(ref_num_key)으로 Ref 를 맞춘다 — 캐시 키가 같아야 찾을 수 있다
+        ref_m = ref_num_key.match(ref_token)
+        if not ref_m:
+            continue
+        ref = ref_m.group(0)
+        key = (ref, app_no, doc_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "ref": ref,
+            "app_no": app_no,
+            "receipt_date": kipris.iso_date(receipt),
+            "doc_type": doc_type,
+            "applicant": applicant,
+        })
+    return rows
+
+
+def _case_key(ref, doc_type):
+    return f"{ref}|{doc_type}"
+
+
+def load_case_cache():
+    if os.path.exists(CASE_CACHE_FILE):
+        try:
+            with open(CASE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logging.error(f"사건 캐시 로드 실패: {e}")
+    return {}
+
+
+def save_case_cache(cache, today=None):
+    """사건 캐시를 저장합니다. 받은 지 CASE_CACHE_KEEP_DAYS 가 지난 항목은 지웁니다."""
+    cutoff = ((today or date.today()) - timedelta(days=CASE_CACHE_KEEP_DAYS)).isoformat()
+    kept = {k: v for k, v in cache.items() if (v.get("received_at") or "9999") >= cutoff}
+    try:
+        tmp = CASE_CACHE_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(kept, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CASE_CACHE_FILE)
+    except Exception as e:
+        logging.error(f"사건 캐시 저장 실패: {e}")
+
+
+def find_oa_case(cache, ref_num):
+    """Ref 의 의견제출통지서 항목 가운데 접수일이 가장 늦은 것. 없으면 None."""
+    cands = [
+        v for k, v in cache.items()
+        if k.split("|", 1)[0] == ref_num and OA_DOC_TYPE in (v.get("doc_type") or "")
+    ]
+    return max(cands, key=lambda v: v.get("receipt_date") or "") if cands else None
+
+
+def handle_prenotice(message):
+    """예고 메일 한 통을 처리합니다. 의견제출통지서 행은 KIPRIS 마감기한을 1회 조회해 함께 저장합니다.
+
+    이미 같은 내용(Ref·문서종류·출원번호·접수일)으로 저장된 행은 건너뜁니다(KIPRIS 다시 부르지 않음).
+    단 의견제출통지서인데 마감기한을 아직 못 받은 행은 다시 조회합니다(지난번 조회 실패·KIPRIS 미반영).
+    반환값: 새로 저장(또는 갱신)한 행 수
+    """
+    rows = parse_prenotice_rows(message.Body, config["prenotice_assignee"])
+    if not rows:
+        logging.info(f"예고 메일에서 담당자 행을 찾지 못했습니다: {message.Subject}")
+        return 0
+
+    cache = load_case_cache()
+    received_at = message.CreationTime.strftime("%Y-%m-%d")
+    added = 0
+    for row in rows:
+        key = _case_key(row["ref"], row["doc_type"])
+        old = cache.get(key)
+        is_oa = OA_DOC_TYPE in row["doc_type"]
+        same = old and old.get("app_no") == row["app_no"] and old.get("receipt_date") == row["receipt_date"]
+        if same and (old.get("due_date") or not is_oa):
+            continue
+
+        entry = {
+            "app_no": row["app_no"],
+            "doc_type": row["doc_type"],
+            "receipt_date": row["receipt_date"],
+            "due_date": "",
+            "received_at": received_at,
+        }
+        if same:
+            entry["received_at"] = old.get("received_at") or received_at
+        if is_oa:
+            try:
+                notice = kipris.pick_oa_due(kipris.fetch_due_dates(row["app_no"]), row["doc_type"])
+                if notice:
+                    entry["due_date"] = notice.due_date
+                    logging.info(
+                        f"KIPRIS 마감기한: {row['ref']} {row['app_no']} {notice.title} "
+                        f"발송번호 {notice.send_number} → {notice.due_date}"
+                    )
+                else:
+                    logging.info(f"KIPRIS 에 {row['doc_type']} 마감기한이 아직 없습니다: {row['ref']} {row['app_no']}")
+            except kipris.KiprisError as e:
+                logging.error(f"KIPRIS 조회 실패 ({row['ref']} {row['app_no']}): {e}")
+
+        cache[key] = entry
+        added += 1
+        logging.info(f"예고 메일 저장: {key} → {entry}")
+
+    if added:
+        save_case_cache(cache)
+    return added
+
+
+def is_prenotice(message):
+    return PRENOTICE_SUBJECT in message.Subject and sender_matches(message, PRENOTICE_SENDERS)
+
+
+def scan_prenotices(outlook, days=PRENOTICE_SCAN_DAYS):
+    """앱이 꺼져 있던 동안 받은 편지함에 도착한 예고 메일을 처리합니다 (최근 days 일).
+
+    확인을 마치고 다른 폴더로 옮긴 예고 메일은 보지 않습니다.
+    """
+    inbox = outlook.GetDefaultFolder(6)
+    query = (
+        build_sender_filter(PRENOTICE_SENDERS)
+        + f" AND {_DASL_SUBJECT} LIKE {_dasl_str('%' + PRENOTICE_SUBJECT + '%')}"
+    )
+    since = date.today() - timedelta(days=days)
+    messages = [m for m in inbox.Items.Restrict(query) if m.CreationTime.date() >= since]
+    for message in sorted(messages, key=lambda m: m.CreationTime):  # 오래된 것부터
+        try:
+            handle_prenotice(message)
+        except Exception as e:
+            logging.error(f"예고 메일 처리 실패: {e}")
+
+
+def resolve_oa_dates(mail_date, fallback_date, case, today):
+    """OA 청서류 기한을 정합니다. KIPRIS 는 부르지 않고 예고 메일 때 저장한 값만 씁니다.
+
+    반환값: (action_date, source, warning) — source 는 "KIPRIS" 또는 "계산식"
+    """
+    if case is None:
+        return fallback_date, "계산식", "예고 메일 정보가 없어 계산식을 적용했습니다."
+    due = case.get("due_date") or ""
+    if not due:
+        return fallback_date, "계산식", (
+            f"KIPRIS 마감기한이 없어 계산식을 적용했습니다 (출원번호 {case.get('app_no', '')})."
+        )
+    try:
+        due_date = date.fromisoformat(due)
+    except ValueError:
+        return fallback_date, "계산식", f"KIPRIS 마감기한 형식이 잘못되어 계산식을 적용했습니다 ({due})."
+    if due_date < today or (mail_date is not None and due_date <= mail_date):
+        return fallback_date, "계산식", (
+            f"KIPRIS 마감기한 {due}이(가) 오늘 이전이거나 서신 기한보다 빨라 무시했습니다."
+        )
+    return due_date, "KIPRIS", ""
+
+
+def dates_editable(rejection_type, action_source):
+    """날짜를 고칠 수 있는가 — OA 에서 KIPRIS 마감기한을 쓸 수 없을 때만."""
+    return rejection_type == "OA" and action_source != "KIPRIS"
+
+
+STATUS_ADDED = "추가됨"
+STATUS_DUPLICATE = "건너뜀(중복)"
+
+
+def _register_appointment(folder, subject, day, body):
+    """종일 일정 하나를 등록합니다. 같은 제목·날짜가 이미 있으면 건너뜁니다.
+
+    반환값: STATUS_ADDED 또는 STATUS_DUPLICATE
+    """
+    if check_duplicate_appointment(folder, subject, day):
+        logging.info(f"캘린더 일정 건너뜀(중복): {subject} ({day})")
+        return STATUS_DUPLICATE
+    appointment = folder.Items.Add()
+    appointment.Subject = subject
+    appointment.Start = pytz.utc.localize(datetime.combine(day, time(0, 0, 0)))
+    appointment.AllDayEvent = True
+    appointment.Body = body
+    appointment.Save()
+    logging.info(f"캘린더 일정 추가됨: {subject} ({day})")
+    return STATUS_ADDED
+
+
+class ScheduleDialog(qtw.QDialog):
+    """캘린더 등록 알림창 — 날짜·출처(KIPRIS 사용 여부)·등록 결과를 한 창에 보여 줍니다.
+
+    editable=False: 이미 등록한 결과(results)를 보여 주고 [닫기]만 둡니다.
+    editable=True : 날짜를 고치고 일정별로 고를 수 있습니다. [등록]을 누르면 register 를 불러
+                    등록한 뒤, 같은 창에 결과를 채우고 날짜를 잠급니다.
+    """
+
+    def __init__(self, parent=None, ref_num="", doc_label="", items=(), source_text="", warning="",
+                 editable=False, register=None, results=None):
         super().__init__(parent)
-        self.setWindowTitle("Schedule Registration & Edit")
-        self.resize(440, 280)
+        self.setWindowTitle("캘린더 등록")
+        self.resize(460, 260)
 
-        self.ref_num = ref_num
-        self.subj_comments = subj_comments
-        self.target_date = target_date
-        self.subj_action = subj_action
-        self.response_date = response_date
+        self.items = list(items)        # [(그룹 제목, 일정 제목, 날짜), ...]
+        self.editable = editable
+        self.register = register        # [(index, 날짜), ...] -> {index: 결과}
+        self.registered = bool(results)
+        self.checks, self.date_edits, self.result_labels = [], [], []
 
-        self.initUI()
-
-    def initUI(self):
         layout = qtw.QVBoxLayout(self)
 
-        info_label = qtw.QLabel(
-            f"<b>[Ref: {self.ref_num}]</b> 캘린더 자동 등록 일정 확인<br>"
-            "등록할 일정을 확인하고 날짜를 필요에 맞게 수정하세요."
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
+        header = qtw.QLabel(f"<b>[Ref: {ref_num}]</b> {doc_label}")
+        layout.addWidget(header)
 
-        # 1. Comments 일정 그룹
-        comments_group = qtw.QGroupBox("Comments 일정 (Folder: Mail)")
-        comments_layout = qtw.QHBoxLayout()
+        source = qtw.QLabel(source_text + (f"<br><small>{warning}</small>" if warning else ""))
+        source.setWordWrap(True)
+        if warning or editable:
+            source.setStyleSheet("background-color: #FDF3E1; color: #8A5300; padding: 6px; border-radius: 4px;")
+        else:
+            source.setStyleSheet("background-color: #E7F4EC; color: #1E6B3A; padding: 6px; border-radius: 4px;")
+        layout.addWidget(source)
 
-        self.chk_comments = qtw.QCheckBox("등록")
-        self.chk_comments.setChecked(True)
+        for i, (group_title, subject, day) in enumerate(self.items):
+            group = qtw.QGroupBox(group_title)
+            row = qtw.QHBoxLayout()
 
-        lbl_comments = qtw.QLabel(self.subj_comments)
-        lbl_comments.setMinimumWidth(140)
+            if editable:
+                chk = qtw.QCheckBox("등록")
+                chk.setChecked(True)
+                row.addWidget(chk)
+                self.checks.append(chk)
 
-        self.date_comments = qtw.QDateEdit()
-        self.date_comments.setCalendarPopup(True)
-        self.date_comments.setDisplayFormat("yyyy-MM-dd")
-        if self.target_date:
-            self.date_comments.setDate(qtc.QDate(self.target_date.year, self.target_date.month, self.target_date.day))
+            lbl = qtw.QLabel(subject)
+            lbl.setMinimumWidth(140)
+            row.addWidget(lbl)
 
-        comments_layout.addWidget(self.chk_comments)
-        comments_layout.addWidget(lbl_comments)
-        comments_layout.addWidget(self.date_comments)
-        comments_group.setLayout(comments_layout)
-        layout.addWidget(comments_group)
+            if editable:
+                date_edit = qtw.QDateEdit()
+                date_edit.setCalendarPopup(True)
+                date_edit.setDisplayFormat("yyyy-MM-dd")
+                date_edit.setDate(qtc.QDate(day.year, day.month, day.day))
+                self.checks[-1].toggled.connect(date_edit.setEnabled)
+                row.addWidget(date_edit)
+                self.date_edits.append(date_edit)
+            else:
+                row.addWidget(qtw.QLabel(day.isoformat()))
 
-        # 2. Action 일정 그룹
-        action_group = qtw.QGroupBox("Action 일정 (Folder: No_Instructions)")
-        action_layout = qtw.QHBoxLayout()
+            result = qtw.QLabel()
+            result.setMinimumWidth(80)
+            row.addWidget(result)
+            self.result_labels.append(result)
 
-        self.chk_action = qtw.QCheckBox("등록")
-        self.chk_action.setChecked(True)
+            group.setLayout(row)
+            layout.addWidget(group)
 
-        lbl_action = qtw.QLabel(self.subj_action)
-        lbl_action.setMinimumWidth(140)
-
-        self.date_action = qtw.QDateEdit()
-        self.date_action.setCalendarPopup(True)
-        self.date_action.setDisplayFormat("yyyy-MM-dd")
-        if self.response_date:
-            self.date_action.setDate(qtc.QDate(self.response_date.year, self.response_date.month, self.response_date.day))
-
-        action_layout.addWidget(self.chk_action)
-        action_layout.addWidget(lbl_action)
-        action_layout.addWidget(self.date_action)
-        action_group.setLayout(action_layout)
-        layout.addWidget(action_group)
-
-        self.chk_comments.toggled.connect(self.date_comments.setEnabled)
-        self.chk_action.toggled.connect(self.date_action.setEnabled)
+        if results:
+            self._show_results(results)
 
         btn_box = qtw.QHBoxLayout()
         btn_box.addStretch()
-
-        self.btn_confirm = qtw.QPushButton("등록")
-        self.btn_confirm.clicked.connect(self.accept)
-
+        self.btn_register = qtw.QPushButton("등록")
+        self.btn_register.clicked.connect(self._on_register)
         self.btn_cancel = qtw.QPushButton("취소")
         self.btn_cancel.setObjectName("quitButton")
         self.btn_cancel.clicked.connect(self.reject)
-
-        btn_box.addWidget(self.btn_confirm)
-        btn_box.addWidget(self.btn_cancel)
+        self.btn_close = qtw.QPushButton("닫기")
+        self.btn_close.clicked.connect(self.accept)
+        for btn in (self.btn_register, self.btn_cancel, self.btn_close):
+            btn_box.addWidget(btn)
         layout.addLayout(btn_box)
 
-    def get_results(self):
-        """다이얼로그에서 설정한 결과 반환
-        Returns:
-            (enabled_comments, target_date, enabled_action, response_date)
-        """
-        qdate_comments = self.date_comments.date()
-        qdate_action = self.date_action.date()
+        self.btn_register.setVisible(editable)
+        self.btn_cancel.setVisible(editable)
+        self.btn_close.setVisible(not editable)
 
-        py_target_date = qdate_comments.toPython()
-        py_response_date = qdate_action.toPython()
+    def _show_results(self, results):
+        for i, label in enumerate(self.result_labels):
+            status = results.get(i, "등록 안 함")
+            label.setText(status)
+            color = "#1E6B3A" if status == STATUS_ADDED else "#C0392B" if status.startswith("오류") else "#6B6B6B"
+            label.setStyleSheet(f"color: {color};")
 
-        return (
-            self.chk_comments.isChecked(),
-            py_target_date,
-            self.chk_action.isChecked(),
-            py_response_date
-        )
+    def _on_register(self):
+        selected = [
+            (i, self.date_edits[i].date().toPython())
+            for i, chk in enumerate(self.checks) if chk.isChecked()
+        ]
+        try:
+            results = self.register(selected) if selected else {}
+        except Exception as e:
+            logging.error(f"캘린더 일정 등록 실패: {e}", exc_info=True)
+            results = {i: f"오류: {e}" for i, _day in selected}
+        self.registered = True
+        self._show_results(results)
+
+        # 등록을 마쳤으면 날짜를 잠그고 [닫기]만 남긴다
+        for widget in self.checks + self.date_edits:
+            widget.setEnabled(False)
+        self.btn_register.setVisible(False)
+        self.btn_cancel.setVisible(False)
+        self.btn_close.setVisible(True)
 
 
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
@@ -455,6 +679,14 @@ class Handler_Class:
                 if Handler_Class.main_win is not None and new_items:
                     for item in new_items:
                         Handler_Class.main_win.add_table_row(*item)
+
+            # 예고 메일(사건 담당자 지정): 출원번호·KIPRIS 마감기한을 Ref 별로 저장해 둔다
+            if is_prenotice(message):
+                try:
+                    handle_prenotice(message)
+                except Exception as e:
+                    logging.error(f"예고 메일 처리 실패: {e}", exc_info=True)
+                continue
 
             # 이름 추출 - 조건 체크 전 실패 가능성 처리
             names = name_key.findall(message.Subject)
@@ -505,15 +737,15 @@ class Handler_Class:
 
         target_date = None
         response_date = None
+        action_source = ""
+        warning = ""
 
         if match:
             target_date_str = match.group(1)
             target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
 
-            four_months_later = target_date + relativedelta(months=4)
-
             if rejection_type == "OA":
-                response_date = four_months_later - timedelta(days=11)
+                response_date = target_date + relativedelta(months=4) - timedelta(days=11)
             else:
                 receipt_date = message.CreationTime.date()
                 response_date = receipt_date + relativedelta(months=3)
@@ -521,63 +753,53 @@ class Handler_Class:
             target_date = message.CreationTime.date()
             response_date = message.CreationTime.date()
 
-        # 알림창(대화상자)을 띄워 사용자에게 날짜 확인 및 수정 기회 제공
-        parent_win = qtw.QApplication.activeWindow()
-        dialog = ScheduleEditDialog(
-            parent=parent_win,
+        if rejection_type == "OA":
+            # 예고 메일 때 저장한 KIPRIS 마감기한을 쓴다. 없으면 위에서 계산한 값(계산식) 그대로.
+            case = find_oa_case(load_case_cache(), ref_num)
+            response_date, action_source, warning = resolve_oa_dates(
+                target_date, response_date, case, date.today()
+            )
+            logging.info(f"OA 청서류 기한: {ref_num} → {response_date} ({action_source}) {warning}")
+
+        items = [
+            ("Comments 일정 (Folder: Mail)", subj_comments, target_date),
+            ("Action 일정 (Folder: No_Instructions)", subj_action, response_date),
+        ]
+        folders = [subfolder, subfolder2]
+        body = f"Task details: {message.Body}"
+
+        def register(selected):
+            return {i: _register_appointment(folders[i], items[i][1], day, body) for i, day in selected}
+
+        if rejection_type == "OA":
+            doc_label = "의견제출통지서 (OA)"
+            if action_source == "KIPRIS":
+                source_text = "청서류 기한: KIPRIS 마감기한 사용"
+            else:
+                source_text = "⚠ KIPRIS 마감기한 사용 불가 → 계산식 적용 (날짜를 확인하세요)"
+        else:
+            doc_label = "거절결정서 (FR)"
+            source_text = "청서류 기한: 계산식 (수신일 + 3개월)"
+
+        # 날짜를 고칠 수 없으면 바로 등록하고 결과를 알림창에 보여 준다.
+        # 고칠 수 있으면(OA + KIPRIS 사용 불가) 알림창에서 확인·수정한 뒤 [등록] — 결과는 같은 창에 표시.
+        editable = dates_editable(rejection_type, action_source)
+        results = None if editable else register([(0, target_date), (1, response_date)])
+
+        dialog = ScheduleDialog(
+            parent=qtw.QApplication.activeWindow(),
             ref_num=ref_num,
-            subj_comments=subj_comments,
-            target_date=target_date,
-            subj_action=subj_action,
-            response_date=response_date
+            doc_label=doc_label,
+            items=items,
+            source_text=source_text,
+            warning=warning,
+            editable=editable,
+            register=register,
+            results=results,
         )
-
-        if dialog.exec() != qtw.QDialog.DialogCode.Accepted:
+        dialog.exec()
+        if editable and not dialog.registered:
             logging.info(f"캘린더 일정 등록이 사용자에 의해 취소되었습니다. Ref: {ref_num}")
-            return
-
-        enabled_comments, final_target_date, enabled_action, final_response_date = dialog.get_results()
-
-        utc_timezone = pytz.utc
-        msg_parts = []
-
-        if enabled_comments:
-            target_date_utc = utc_timezone.localize(datetime.combine(final_target_date, time(0, 0, 0)))
-            dup_comments = check_duplicate_appointment(subfolder, subj_comments, final_target_date)
-            if not dup_comments:
-                appointment = subfolder.Items.Add()
-                appointment.Subject = subj_comments
-                appointment.Start = target_date_utc
-                appointment.AllDayEvent = True
-                appointment.Body = f"Task details: {message.Body}"
-                appointment.Save()
-                msg_parts.append(f"추가됨: {subj_comments} ({final_target_date})")
-                logging.info(f"캘린더 일정 추가됨: {subj_comments} ({final_target_date})")
-            else:
-                msg_parts.append(f"건너뜀(중복): {subj_comments} ({final_target_date})")
-                logging.info(f"캘린더 일정 건너뜀(중복): {subj_comments} ({final_target_date})")
-
-        if enabled_action:
-            response_date_utc = utc_timezone.localize(datetime.combine(final_response_date, time(0, 0, 0)))
-            dup_action = check_duplicate_appointment(subfolder2, subj_action, final_response_date)
-            if not dup_action:
-                appointment2 = subfolder2.Items.Add()
-                appointment2.Subject = subj_action
-                appointment2.Start = response_date_utc
-                appointment2.AllDayEvent = True
-                appointment2.Body = f"Task details: {message.Body}"
-                appointment2.Save()
-                msg_parts.append(f"추가됨: {subj_action} ({final_response_date})")
-                logging.info(f"캘린더 일정 추가됨: {subj_action} ({final_response_date})")
-            else:
-                msg_parts.append(f"건너뜀(중복): {subj_action} ({final_response_date})")
-                logging.info(f"캘린더 일정 건너뜀(중복): {subj_action} ({final_response_date})")
-
-        if msg_parts:
-            result_box = qtw.QMessageBox(parent_win)
-            result_box.setWindowTitle("Schedule Creation Result")
-            result_box.setText("\n".join(msg_parts))
-            result_box.exec()
 
 
 class MainWin(qtw.QWidget):
@@ -979,6 +1201,10 @@ if __name__ == "__main__":
     Handler_Class.outlook = outlook_new  # 클래스 변수로 주입
 
     attach_list = save_attachments(outlook_mapi)
+    try:
+        scan_prenotices(outlook_mapi)
+    except Exception as e:
+        logging.error(f"예고 메일 스캔 실패: {e}", exc_info=True)
     app = qtw.QApplication(sys.argv)
     setup_app_fonts(app)
 

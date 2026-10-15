@@ -159,6 +159,7 @@ EK_TRANS_DIC/
 keywords/
 CLAUDE.md
 settings.json
+case_cache.json
 
 # OS files
 .DS_Store
