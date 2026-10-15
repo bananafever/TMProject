@@ -537,7 +537,7 @@ class TestNaverRegistration(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _run(self, naver, selected=None):
-        return main.register_items(self.NAMES, self.ITEMS, "본문", selected or self.SELECTED, naver)
+        return main.register_items(self.NAMES, self.ITEMS, selected or self.SELECTED, naver)
 
     def test_each_folder_to_its_calendar(self):
         naver = MagicMock()
@@ -559,7 +559,7 @@ class TestNaverRegistration(unittest.TestCase):
         naver.add_all_day.return_value = True
         results = self._run(naver, selected=[(1, date(2027, 2, 9))])
         self.assertEqual(results, {1: main.STATUS_ADDED})
-        naver.add_all_day.assert_called_once_with("기한", "PA-2T8084_의견서", date(2027, 2, 9), "본문")
+        naver.add_all_day.assert_called_once_with("기한", "PA-2T8084_의견서", date(2027, 2, 9), "")
 
     def test_missing_calendar_name_is_error(self):
         main.config["naver_calendars"] = {"Mail": "코멘트"}

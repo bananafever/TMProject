@@ -512,13 +512,13 @@ STATUS_ADDED = "추가됨"
 STATUS_DUPLICATE = "건너뜀(중복)"
 
 
-def _register_naver(session, folder_name, subject, day, body):
+def _register_naver(session, folder_name, subject, day):
     """종일 일정 하나를 네이버 캘린더에 등록합니다. 실패해도 예외 대신 「오류: …」 를 돌려줍니다."""
     calendar_name = (config.get("naver_calendars") or {}).get(folder_name, "")
     try:
         if not calendar_name:
             raise naver_cal.NaverError(f"settings.json 의 naver_calendars 에 「{folder_name}」 캘린더 이름이 없습니다.")
-        added = session.add_all_day(calendar_name, subject, day, body)
+        added = session.add_all_day(calendar_name, subject, day, "")  # 메일 본문은 넣지 않는다
     except Exception as e:
         logging.error(f"네이버 캘린더 일정 등록 실패: {subject} ({day}) — {e}")
         return f"오류: {e}"
@@ -527,9 +527,9 @@ def _register_naver(session, folder_name, subject, day, body):
     return status
 
 
-def register_items(folder_names, items, body, selected, naver):
+def register_items(folder_names, items, selected, naver):
     """고른 일정을 네이버 캘린더에 등록합니다. 반환값: {index: 결과}"""
-    return {i: _register_naver(naver, folder_names[i], items[i][1], day, body) for i, day in selected}
+    return {i: _register_naver(naver, folder_names[i], items[i][1], day) for i, day in selected}
 
 
 def failed_indices(results):
@@ -780,10 +780,9 @@ class Handler_Class:
             ("Action 일정 (네이버: No_Instructions)", subj_action, response_date),
         ]
         folder_names = ["Mail", "No_Instructions"]
-        body = f"Task details: {message.Body}"
 
         def register(selected):
-            return register_items(folder_names, items, body, selected, naver_cal.Session())
+            return register_items(folder_names, items, selected, naver_cal.Session())
 
         if rejection_type == "OA":
             doc_label = "의견제출통지서 (OA)"
