@@ -26,6 +26,10 @@ sys.modules["PySide6.QtCore"] = MagicMock()
 
 # main 의 logging.basicConfig(filename='app.log') 가 걸리지 않게 — 테스트가 실제 앱 로그에 쓰지 않는다
 logging.getLogger().addHandler(logging.NullHandler())
+# 실제 데이터 폴더(settings.json·case_cache.json …)를 읽거나 쓰지 않게 빈 임시 폴더를 쓴다
+import tempfile  # noqa: E402
+_TEST_DATA_DIR = tempfile.TemporaryDirectory()
+os.environ["TASKMANAGER_DATA_DIR"] = _TEST_DATA_DIR.name
 
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
@@ -621,6 +625,19 @@ class TestApplicant(unittest.TestCase):
                          "PA-2T8084_의견서_에어프로덕츠")
         self.assertEqual(main.with_applicant("PA-2T8084_의견서", ""), "PA-2T8084_의견서")
         self.assertEqual(main.with_applicant("PA-2T8084_의견서", None), "PA-2T8084_의견서")
+
+    def test_data_dir_order(self):
+        with patch.dict(os.environ, {"TASKMANAGER_DATA_DIR": "X:/data"}):
+            self.assertEqual(main.data_dir(), "X:/data")
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "frozen", True, create=True), \
+                    patch.object(sys, "executable", "D:/apps/TaskManager/TaskManager.exe"):
+                self.assertEqual(os.path.normpath(main.data_dir()), os.path.normpath("D:/apps/TaskManager"))
+            with patch.object(os.path, "isdir", return_value=True):
+                self.assertEqual(main.data_dir(), main.DEFAULT_DATA_DIR)
+            with patch.object(os.path, "isdir", return_value=False):
+                self.assertEqual(main.data_dir(), os.path.dirname(os.path.abspath(main.__file__)))
+        self.assertEqual(main.DATA_DIR, os.environ["TASKMANAGER_DATA_DIR"])  # 테스트는 임시 폴더
 
     def test_parse_names(self):
         self.assertEqual(main.parse_names(" 이여름 ,한송희,, 이여름 "), ["이여름", "한송희"])

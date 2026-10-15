@@ -33,9 +33,36 @@ from PySide6 import QtSvg as qts
 import kipris
 import naver_cal
 
+# ── 데이터 폴더 ─────────────────────────────────────────────────────
+# settings.json(경로·약칭표·담당자)·case_cache.json·calendar_state.json·app.log 를 한 곳에 둔다.
+# exe 는 시작 프로그램 바로가기로 이 폴더에서 실행된다 — 소스로 실행해도 같은 파일을 쓴다.
+DEFAULT_DATA_DIR = r"G:/내 드라이브/bananafever/5_APPS/TaskManager"
+
+
+def data_dir():
+    """환경변수 TASKMANAGER_DATA_DIR → exe 가 있는 폴더 → DEFAULT_DATA_DIR → 소스 폴더(드라이브가 없을 때)."""
+    env = os.getenv("TASKMANAGER_DATA_DIR")
+    if env:
+        return env
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    if os.path.isdir(DEFAULT_DATA_DIR):
+        return DEFAULT_DATA_DIR
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DATA_DIR = data_dir()
+
+
+def data_path(name):
+    return os.path.join(DATA_DIR, name)
+
+
+LOG_FILE = data_path("app.log")
+
 # 로깅 설정
 logging.basicConfig(
-    filename='app.log',
+    filename=LOG_FILE,
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     encoding='utf-8'
@@ -47,7 +74,7 @@ ref_num_key = re.compile(
 )
 name_key = re.compile(r"; [ㄱ-ㅎ|ㅏ-ㅣ|가-힣]+(?=\()")
 
-CONFIG_FILE = "settings.json"
+CONFIG_FILE = data_path("settings.json")
 DEFAULT_CONFIG = {
     "parent_path": r"C:/Dropbox/1_Project/Tasks",
     "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review",
@@ -68,7 +95,7 @@ def load_config():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
                 config.update(loaded)
-                logging.info("설정 파일을 성공적으로 불러왔습니다.")
+                logging.info(f"설정 파일을 성공적으로 불러왔습니다. ({CONFIG_FILE})")
         except Exception as e:
             logging.error(f"설정 파일 로드 실패: {e}")
     else:
@@ -332,7 +359,7 @@ _APP_NO_CELL = re.compile(r"\d{2}-\d{4}-\d{7}")
 _PRENOTICE_CELLS = 6
 OA_DOC_TYPE = "의견제출통지서"  # 「최후의견제출통지서」도 이 글자를 포함한다
 FR_DOC_TYPE = "거절결정"        # 「거절결정서」·「특허거절결정서」 어느 쪽이든
-CASE_CACHE_FILE = "case_cache.json"
+CASE_CACHE_FILE = data_path("case_cache.json")
 CASE_CACHE_KEEP_DAYS = 183
 PRENOTICE_SCAN_DAYS = 14
 
@@ -713,7 +740,7 @@ def failed_indices(results):
 
 
 # ── 등록 기록 (처리한 위임 메일·등록 실패 일정) ──────────────────────────
-CALENDAR_STATE_FILE = "calendar_state.json"
+CALENDAR_STATE_FILE = data_path("calendar_state.json")
 CALENDAR_DONE_KEEP_DAYS = 30
 DELEGATION_SCAN_DAYS = 14
 
@@ -1397,7 +1424,7 @@ class MainWin(qtw.QWidget):
 
     def load_history(self):
         try:
-            with open('app.log', 'r', encoding='utf-8') as f:
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
                 self.history_text.setPlainText(f.read())
             self.history_text.moveCursor(qtg.QTextCursor.End)
         except Exception as e:
