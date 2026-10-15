@@ -517,27 +517,14 @@ class TestScheduleRegistration(unittest.TestCase):
         self.assertTrue(main.dates_editable("OA", "계산식"))
         self.assertFalse(main.dates_editable("FR", ""))
 
-    def test_register_adds_when_not_duplicate(self):
-        folder = MagicMock()
-        appointment = folder.Items.Add.return_value
-        with patch.object(main, "check_duplicate_appointment", return_value=False):
-            status = main._register_appointment(folder, "PA-2T8084_의견서", date(2027, 2, 8), "본문")
-        self.assertEqual(status, main.STATUS_ADDED)
-        self.assertEqual(appointment.Subject, "PA-2T8084_의견서")
-        self.assertTrue(appointment.AllDayEvent)
-        self.assertEqual(appointment.Start.date(), date(2027, 2, 8))
-        appointment.Save.assert_called_once()
-
-    def test_register_skips_duplicate(self):
-        folder = MagicMock()
-        with patch.object(main, "check_duplicate_appointment", return_value=True):
-            status = main._register_appointment(folder, "PA-2T8084_의견서", date(2027, 2, 8), "본문")
-        self.assertEqual(status, main.STATUS_DUPLICATE)
-        folder.Items.Add.assert_not_called()
+    def test_failed_indices_for_retry(self):
+        results = {0: main.STATUS_ADDED, 1: "오류: 연결 실패", 2: main.STATUS_DUPLICATE, 3: "오류: 인증 실패"}
+        self.assertEqual(main.failed_indices(results), [1, 3])
+        self.assertEqual(main.failed_indices({0: main.STATUS_ADDED}), [])
 
 
 class TestNaverRegistration(unittest.TestCase):
-    """Outlook 등록과 함께 네이버 캘린더에도 등록"""
+    """위임 메일 일정은 네이버 캘린더에만 등록"""
 
     ITEMS = [("Comments", "PA-2T8084_Comments", date(2026, 10, 1)),
              ("Action", "PA-2T8084_의견서", date(2027, 2, 8))]
@@ -548,42 +535,39 @@ class TestNaverRegistration(unittest.TestCase):
         patcher = patch.dict(main.config, {"naver_calendars": {"Mail": "코멘트", "No_Instructions": "기한"}})
         patcher.start()
         self.addCleanup(patcher.stop)
-        patcher = patch.object(main, "_register_appointment", return_value=main.STATUS_ADDED)
-        self.outlook = patcher.start()
-        self.addCleanup(patcher.stop)
 
-    def _run(self, naver):
-        return main.register_items([MagicMock(), MagicMock()], self.NAMES, self.ITEMS, "본문", self.SELECTED, naver)
+    def _run(self, naver, selected=None):
+        return main.register_items(self.NAMES, self.ITEMS, "본문", selected or self.SELECTED, naver)
 
-    def test_naver_off_only_outlook(self):
-        results = self._run(None)
-        self.assertEqual(results, {0: (main.STATUS_ADDED, None), 1: (main.STATUS_ADDED, None)})
-
-    def test_naver_each_folder_to_its_calendar(self):
+    def test_each_folder_to_its_calendar(self):
         naver = MagicMock()
         naver.add_all_day.side_effect = [True, False]
         results = self._run(naver)
-        self.assertEqual(results, {0: (main.STATUS_ADDED, main.STATUS_ADDED),
-                                   1: (main.STATUS_ADDED, main.STATUS_DUPLICATE)})
-        calls = [c.args[0] for c in naver.add_all_day.call_args_list]
-        self.assertEqual(calls, ["코멘트", "기한"])
+        self.assertEqual(results, {0: main.STATUS_ADDED, 1: main.STATUS_DUPLICATE})
+        calls = [c.args[:3] for c in naver.add_all_day.call_args_list]
+        self.assertEqual(calls, [("코멘트", "PA-2T8084_Comments", date(2026, 10, 1)),
+                                 ("기한", "PA-2T8084_의견서", date(2027, 2, 8))])
 
-    def test_naver_failure_keeps_outlook(self):
+    def test_failure_is_error_status(self):
         naver = MagicMock()
         naver.add_all_day.side_effect = naver_cal.NaverError("네이버 인증 실패")
         results = self._run(naver)
-        self.assertEqual(self.outlook.call_count, 2)
-        for outlook, naver_status in results.values():
-            self.assertEqual(outlook, main.STATUS_ADDED)
-            self.assertTrue(naver_status.startswith("오류"))
+        self.assertEqual(main.failed_indices(results), [0, 1])
+
+    def test_retry_only_selected(self):
+        naver = MagicMock()
+        naver.add_all_day.return_value = True
+        results = self._run(naver, selected=[(1, date(2027, 2, 9))])
+        self.assertEqual(results, {1: main.STATUS_ADDED})
+        naver.add_all_day.assert_called_once_with("기한", "PA-2T8084_의견서", date(2027, 2, 9), "본문")
 
     def test_missing_calendar_name_is_error(self):
         main.config["naver_calendars"] = {"Mail": "코멘트"}
         naver = MagicMock()
         naver.add_all_day.return_value = True
         results = self._run(naver)
-        self.assertEqual(results[0][1], main.STATUS_ADDED)
-        self.assertTrue(results[1][1].startswith("오류"))
+        self.assertEqual(results[0], main.STATUS_ADDED)
+        self.assertTrue(results[1].startswith("오류"))
 
 
 class TestNaverCal(unittest.TestCase):
@@ -722,8 +706,33 @@ class TestNaverSync(unittest.TestCase):
         calendar.Folders.__getitem__.side_effect = lambda name: MagicMock(Items=MagicMock(
             __iter__=lambda _self: iter(folders[name])))
         events = naver_sync.outlook_events(calendar, date(2026, 10, 16), folders=["Mail", "Complete"])
-        self.assertEqual(events, [("Mail", "B_Comments", date(2026, 10, 16), True),
-                                  ("Complete", "C_의견서", date(2026, 11, 1), False)])
+        self.assertEqual([e[:4] for e in events], [("Mail", "B_Comments", date(2026, 10, 16), True),
+                                                   ("Complete", "C_의견서", date(2026, 11, 1), False)])
+        self.assertIs(events[0][4], folders["Mail"][1])
+
+    def _delete(self, on_naver, apply, recurring=False):
+        session = MagicMock()
+        session.exists.return_value = on_naver
+        item = self._item("PA-2T8084_의견서", datetime(2027, 2, 8))
+        item.IsRecurring = recurring
+        status = naver_sync.delete_status(session, "No_Instructions", item.Subject, date(2027, 2, 8), item, apply)
+        return status, item
+
+    def test_delete_only_when_on_naver(self):
+        status, item = self._delete(on_naver=True, apply=True)
+        self.assertEqual(status, "삭제됨")
+        item.Delete.assert_called_once()
+        status, item = self._delete(on_naver=False, apply=True)
+        self.assertEqual(status, "네이버에 없음 — 유지")
+        item.Delete.assert_not_called()
+
+    def test_delete_preview_and_recurring_never_delete(self):
+        status, item = self._delete(on_naver=True, apply=False)
+        self.assertEqual(status, "삭제 예정")
+        item.Delete.assert_not_called()
+        status, item = self._delete(on_naver=True, apply=True, recurring=True)
+        self.assertEqual(status, "반복 일정 — 유지")
+        item.Delete.assert_not_called()
 
 
 class TestKipris(unittest.TestCase):

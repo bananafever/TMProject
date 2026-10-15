@@ -277,7 +277,6 @@ def _setup():
     for name in names:
         print(f"  - {name}")
     print('\nsettings.json 에 다음을 넣으세요 (이름은 위 목록에서):')
-    print('  "naver_enabled": true,')
     print('  "naver_calendars": {"Mail": "<캘린더 이름>", "No_Instructions": "<캘린더 이름>"}')
     return 0
 

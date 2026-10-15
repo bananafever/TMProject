@@ -5,10 +5,9 @@ import json
 import logging
 import shutil
 import stat
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from time import sleep
 
-import pytz
 try:
     import win32com.client
 except Exception:
@@ -53,8 +52,8 @@ DEFAULT_CONFIG = {
     "parent_path": r"C:/Dropbox/1_Project/Tasks",
     "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review",
     "prenotice_assignee": "신용석",  # 예고 메일 표에서 읽을 담당자
-    "naver_enabled": False,  # 네이버 캘린더에도 등록 (계정: python naver_cal.py --setup)
-    "naver_calendars": {"Mail": "", "No_Instructions": ""},  # Outlook 폴더 → 네이버 캘린더 이름
+    # 위임 메일 일정을 등록할 네이버 캘린더 이름 (계정: python naver_cal.py --setup)
+    "naver_calendars": {"Mail": "Mail", "No_Instructions": "No_Instructions"},
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -320,20 +319,6 @@ def save_attachments(outlook):
     return attach_list
 
 
-def check_duplicate_appointment(folder, subject, start_date):
-    """지정된 폴더에 동일한 제목과 시작 날짜(Start.date())를 가진 일정이 있는지 확인"""
-    items = folder.Items
-    items.IncludeRecurrences = False
-    try:
-        restricted_items = items.Restrict(f"[Subject] = '{subject}'")
-        for item in restricted_items:
-            if hasattr(item, 'Start') and item.Start.date() == start_date:
-                return True
-    except Exception as e:
-        logging.error(f"중복 체크 중 오류 발생: {e}")
-    return False
-
-
 # ── 예고 메일(사건 담당자 지정) ─────────────────────────────────────────
 # 본문 표 한 행: 접수일 / 출원번호 / Ref / 담당자 / 출원인 / 문서종류
 # 예) 20261012	10-2025-7000694	PA-2T8084	신용석	에어 프로덕츠 앤드 케미칼스, 인코오포레이티드	의견제출통지서
@@ -527,26 +512,8 @@ STATUS_ADDED = "추가됨"
 STATUS_DUPLICATE = "건너뜀(중복)"
 
 
-def _register_appointment(folder, subject, day, body):
-    """종일 일정 하나를 등록합니다. 같은 제목·날짜가 이미 있으면 건너뜁니다.
-
-    반환값: STATUS_ADDED 또는 STATUS_DUPLICATE
-    """
-    if check_duplicate_appointment(folder, subject, day):
-        logging.info(f"캘린더 일정 건너뜀(중복): {subject} ({day})")
-        return STATUS_DUPLICATE
-    appointment = folder.Items.Add()
-    appointment.Subject = subject
-    appointment.Start = pytz.utc.localize(datetime.combine(day, time(0, 0, 0)))
-    appointment.AllDayEvent = True
-    appointment.Body = body
-    appointment.Save()
-    logging.info(f"캘린더 일정 추가됨: {subject} ({day})")
-    return STATUS_ADDED
-
-
 def _register_naver(session, folder_name, subject, day, body):
-    """같은 일정을 네이버 캘린더에도 등록합니다. 실패해도 예외 대신 「오류: …」 를 돌려줍니다."""
+    """종일 일정 하나를 네이버 캘린더에 등록합니다. 실패해도 예외 대신 「오류: …」 를 돌려줍니다."""
     calendar_name = (config.get("naver_calendars") or {}).get(folder_name, "")
     try:
         if not calendar_name:
@@ -560,17 +527,14 @@ def _register_naver(session, folder_name, subject, day, body):
     return status
 
 
-def register_items(folders, folder_names, items, body, selected, naver=None):
-    """고른 일정을 Outlook 에 (naver 세션이 있으면 네이버에도) 등록합니다.
+def register_items(folder_names, items, body, selected, naver):
+    """고른 일정을 네이버 캘린더에 등록합니다. 반환값: {index: 결과}"""
+    return {i: _register_naver(naver, folder_names[i], items[i][1], day, body) for i, day in selected}
 
-    반환값: {index: (Outlook 결과, 네이버 결과 또는 None)}
-    """
-    results = {}
-    for i, day in selected:
-        subject = items[i][1]
-        outlook = _register_appointment(folders[i], subject, day, body)
-        results[i] = (outlook, _register_naver(naver, folder_names[i], subject, day, body) if naver else None)
-    return results
+
+def failed_indices(results):
+    """「오류」로 끝난 일정의 index — [다시 시도] 대상."""
+    return sorted(i for i, status in results.items() if status.startswith("오류"))
 
 
 class ScheduleDialog(qtw.QDialog):
@@ -579,19 +543,22 @@ class ScheduleDialog(qtw.QDialog):
     editable=False: 이미 등록한 결과(results)를 보여 주고 [닫기]만 둡니다.
     editable=True : 날짜를 고치고 일정별로 고를 수 있습니다. [등록]을 누르면 register 를 불러
                     등록한 뒤, 같은 창에 결과를 채우고 날짜를 잠급니다.
+    등록에 실패한 일정이 있으면 [다시 시도]로 그 일정만 다시 등록합니다.
     """
 
     def __init__(self, parent=None, ref_num="", doc_label="", items=(), source_text="", warning="",
                  editable=False, register=None, results=None):
         super().__init__(parent)
         self.setWindowTitle("캘린더 등록")
-        self.resize(560, 260)
+        self.resize(460, 260)
 
+        self.ref_num = ref_num
         self.items = list(items)        # [(그룹 제목, 일정 제목, 날짜), ...]
         self.editable = editable
-        self.register = register        # [(index, 날짜), ...] -> {index: (Outlook 결과, 네이버 결과|None)}
+        self.register = register        # [(index, 날짜), ...] -> {index: 결과}
         self.registered = bool(results)
-        self.checks, self.date_edits, self.result_labels, self.naver_labels = [], [], [], []
+        self.results = {}
+        self.checks, self.date_edits, self.result_labels = [], [], []
 
         layout = qtw.QVBoxLayout(self)
 
@@ -636,19 +603,13 @@ class ScheduleDialog(qtw.QDialog):
             row.addWidget(result)
             self.result_labels.append(result)
 
-            naver = qtw.QLabel()
-            naver.setVisible(False)
-            row.addWidget(naver)
-            self.naver_labels.append(naver)
-
             group.setLayout(row)
             layout.addWidget(group)
 
-        if results:
-            self._show_results(results)
-
         btn_box = qtw.QHBoxLayout()
         btn_box.addStretch()
+        self.btn_retry = qtw.QPushButton("다시 시도")
+        self.btn_retry.clicked.connect(self._on_retry)
         self.btn_register = qtw.QPushButton("등록")
         self.btn_register.clicked.connect(self._on_register)
         self.btn_cancel = qtw.QPushButton("취소")
@@ -656,39 +617,58 @@ class ScheduleDialog(qtw.QDialog):
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_close = qtw.QPushButton("닫기")
         self.btn_close.clicked.connect(self.accept)
-        for btn in (self.btn_register, self.btn_cancel, self.btn_close):
+        for btn in (self.btn_retry, self.btn_register, self.btn_cancel, self.btn_close):
             btn_box.addWidget(btn)
         layout.addLayout(btn_box)
 
+        self.btn_retry.setVisible(False)
         self.btn_register.setVisible(editable)
         self.btn_cancel.setVisible(editable)
         self.btn_close.setVisible(not editable)
+
+        if results:
+            self._show_results(results)
 
     @staticmethod
     def _status_color(status):
         return "#1E6B3A" if status == STATUS_ADDED else "#C0392B" if status.startswith("오류") else "#6B6B6B"
 
     def _show_results(self, results):
-        for i, (label, naver_label) in enumerate(zip(self.result_labels, self.naver_labels)):
-            status, naver = results.get(i, ("등록 안 함", None))
+        """results 에 든 일정만 결과를 바꾼다 — [다시 시도]는 실패한 일정만 넘긴다."""
+        self.results.update(results)
+        for i, label in enumerate(self.result_labels):
+            status = self.results.get(i, "등록 안 함")
             label.setText(status)
+            label.setToolTip(status)
             label.setStyleSheet(f"color: {self._status_color(status)};")
-            naver_label.setVisible(naver is not None)
-            if naver is not None:
-                naver_label.setText(f"네이버: {naver}")
-                naver_label.setToolTip(naver)
-                naver_label.setStyleSheet(f"color: {self._status_color(naver)};")
+        self.btn_retry.setVisible(bool(failed_indices(self.results)))
+
+    def _day(self, i):
+        return self.date_edits[i].date().toPython() if self.editable else self.items[i][2]
+
+    def _call_register(self, selected):
+        try:
+            return self.register(selected) if selected else {}
+        except Exception as e:
+            logging.error(f"캘린더 일정 등록 실패: {e}", exc_info=True)
+            return {i: f"오류: {e}" for i, _day in selected}
+
+    def _on_retry(self):
+        self._show_results(self._call_register([(i, self._day(i)) for i in failed_indices(self.results)]))
+
+    def done(self, result):
+        failed = failed_indices(self.results)
+        if failed:
+            subjects = ", ".join(self.items[i][1] for i in failed)
+            logging.warning(f"네이버 등록 실패 상태로 닫음: Ref {self.ref_num} — {subjects}")
+        super().done(result)
 
     def _on_register(self):
         selected = [
             (i, self.date_edits[i].date().toPython())
             for i, chk in enumerate(self.checks) if chk.isChecked()
         ]
-        try:
-            results = self.register(selected) if selected else {}
-        except Exception as e:
-            logging.error(f"캘린더 일정 등록 실패: {e}", exc_info=True)
-            results = {i: (f"오류: {e}", None) for i, _day in selected}
+        results = self._call_register(selected)
         self.registered = True
         self._show_results(results)
 
@@ -751,17 +731,7 @@ class Handler_Class:
                 self.add_calendar_event(message, rejection_type)
 
     def add_calendar_event(self, message, rejection_type):
-        # Outlook의 Calendar에 접근
-        calendar = Handler_Class.outlook.GetNamespace("MAPI").GetDefaultFolder(
-            9
-        )  # 9은 Calendar 폴더
-
-        subfolder_name = "Mail"
-        subfolder = calendar.Folders[subfolder_name]
-
-        subfolder2_name = "No_Instructions"
-        subfolder2 = calendar.Folders[subfolder2_name]
-
+        """위임 메일의 Comments·Action 일정을 네이버 캘린더(Mail·No_Instructions)에 등록한다."""
         # Ref 번호 추출
         ref_nums = ref_num_key.findall(message.Subject)
         if not ref_nums:
@@ -806,16 +776,14 @@ class Handler_Class:
             logging.info(f"OA 청서류 기한: {ref_num} → {response_date} ({action_source}) {warning}")
 
         items = [
-            ("Comments 일정 (Folder: Mail)", subj_comments, target_date),
-            ("Action 일정 (Folder: No_Instructions)", subj_action, response_date),
+            ("Comments 일정 (네이버: Mail)", subj_comments, target_date),
+            ("Action 일정 (네이버: No_Instructions)", subj_action, response_date),
         ]
-        folders = [subfolder, subfolder2]
-        folder_names = [subfolder_name, subfolder2_name]
+        folder_names = ["Mail", "No_Instructions"]
         body = f"Task details: {message.Body}"
 
         def register(selected):
-            naver = naver_cal.Session() if config.get("naver_enabled") else None
-            return register_items(folders, folder_names, items, body, selected, naver)
+            return register_items(folder_names, items, body, selected, naver_cal.Session())
 
         if rejection_type == "OA":
             doc_label = "의견제출통지서 (OA)"
