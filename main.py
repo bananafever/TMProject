@@ -54,6 +54,8 @@ DEFAULT_CONFIG = {
     "prenotice_assignee": "신용석",  # 예고 메일 표에서 읽을 담당자
     # 위임 메일 일정을 등록할 네이버 캘린더 이름 (계정: python naver_cal.py --setup)
     "naver_calendars": {"Mail": "Mail", "No_Instructions": "No_Instructions"},
+    # 일정 제목 끝에 붙일 출원인 약칭 (예고 메일의 국문 명칭 → 약칭). 없으면 자동으로 줄인다.
+    "applicant_abbr": {},
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -431,12 +433,16 @@ def handle_prenotice(message):
         is_fr = FR_DOC_TYPE in row["doc_type"]
         same = old and old.get("app_no") == row["app_no"] and old.get("receipt_date") == row["receipt_date"]
         if same and (old.get("due_date") if is_oa else ("reexam" in old if is_fr else True)):
+            if old.get("applicant") != row["applicant"]:  # 출원인 저장 전에 받은 행 — KIPRIS 는 다시 부르지 않는다
+                old["applicant"] = row["applicant"]
+                added += 1
             continue
 
         entry = {
             "app_no": row["app_no"],
             "doc_type": row["doc_type"],
             "receipt_date": row["receipt_date"],
+            "applicant": row["applicant"],
             "due_date": "",
             "received_at": received_at,
         }
@@ -494,6 +500,60 @@ def scan_prenotices(outlook, days=PRENOTICE_SCAN_DAYS):
             logging.error(f"예고 메일 처리 실패: {e}")
 
 
+ABBR_LEN = 6
+# 이름 앞뒤에 단어로 붙는 법인 표기 — 약칭에서 뗀다
+_CORP_PREFIXES = ("주식회사", "(주)", "유한회사", "가부시키가이샤", "카부시키가이샤")
+_CORP_SUFFIXES = _CORP_PREFIXES + (
+    "가이샤", "가부시키", "인코포레이티드", "인코오포레이티드", "인크", "인크.", "코포레이션", "코오포레이션",
+    "컴퍼니", "앤드", "리미티드", "엘엘씨", "엘티디", "게엠베하", "악티엔게젤샤프트", "아게", "에스알엘",
+    "에스에이", "에스.에이.", "엔.브이.", "비.브이.",
+)
+# 띄어 쓰지 않고 이름 끝에 붙는 것 — 「도쿄엘렉트론가부시키가이샤」
+_CORP_GLUED = ("가부시키가이샤", "카부시키가이샤", "주식회사", "유한회사")
+
+
+def squash(text):
+    """앞뒤·연속 공백 정리."""
+    return " ".join((text or "").split())
+
+
+def applicant_abbr(name):
+    """일정 제목에 붙일 출원인 약칭. 약칭표에 있으면 그것, 없으면 법인 표기·공백을 떼고 앞 ABBR_LEN 자."""
+    name = squash(name)
+    table = {squash(k): v for k, v in (config.get("applicant_abbr") or {}).items()}
+    if table.get(name):
+        return table[name]
+    words = name.replace(",", " ").split()
+    while words and words[0] in _CORP_PREFIXES:
+        words.pop(0)
+    while words:
+        last = words[-1]
+        if last in _CORP_SUFFIXES:
+            words.pop()
+            continue
+        glued = next((s for s in _CORP_GLUED if last.endswith(s) and len(last) > len(s)), "")
+        if not glued:
+            break
+        words[-1] = last[:-len(glued)]
+    short = "".join(words).strip(".") or name.replace(" ", "")
+    return short[:ABBR_LEN]
+
+
+def with_applicant(subject, applicant):
+    """출원인이 있으면 제목 끝에 「_약칭」."""
+    return f"{subject}_{applicant_abbr(applicant)}" if squash(applicant) else subject
+
+
+def abbr_table_from_rows(rows):
+    """Settings 약칭표의 (명칭, 약칭) 행들 → dict. 빈 칸이 있는 행은 버리고, 같은 명칭은 뒤의 것."""
+    table = {}
+    for name, abbr in rows:
+        name, abbr = squash(name), squash(abbr)
+        if name and abbr:
+            table[name] = abbr
+    return table
+
+
 def fr_action(ref_num, case):
     """거절결정서 Action 일정 제목을 정합니다. 예고 메일 때 저장한 재심사 여부만 씁니다.
 
@@ -540,13 +600,13 @@ STATUS_ADDED = "추가됨"
 STATUS_DUPLICATE = "건너뜀(중복)"
 
 
-def _register_naver(session, folder_name, subject, day):
+def _register_naver(session, folder_name, subject, day, memo=""):
     """종일 일정 하나를 네이버 캘린더에 등록합니다. 실패해도 예외 대신 「오류: …」 를 돌려줍니다."""
     calendar_name = (config.get("naver_calendars") or {}).get(folder_name, "")
     try:
         if not calendar_name:
             raise naver_cal.NaverError(f"settings.json 의 naver_calendars 에 「{folder_name}」 캘린더 이름이 없습니다.")
-        added = session.add_all_day(calendar_name, subject, day, "")  # 메일 본문은 넣지 않는다
+        added = session.add_all_day(calendar_name, subject, day, memo)  # 메일 본문은 넣지 않는다
     except Exception as e:
         logging.error(f"네이버 캘린더 일정 등록 실패: {subject} ({day}) — {e}")
         return f"오류: {e}"
@@ -555,9 +615,9 @@ def _register_naver(session, folder_name, subject, day):
     return status
 
 
-def register_items(folder_names, items, selected, naver):
-    """고른 일정을 네이버 캘린더에 등록합니다. 반환값: {index: 결과}"""
-    return {i: _register_naver(naver, folder_names[i], items[i][1], day) for i, day in selected}
+def register_items(folder_names, items, selected, naver, memo=""):
+    """고른 일정을 네이버 캘린더에 등록합니다. memo 는 일정 설명칸. 반환값: {index: 결과}"""
+    return {i: _register_naver(naver, folder_names[i], items[i][1], day, memo) for i, day in selected}
 
 
 def failed_indices(results):
@@ -768,12 +828,16 @@ class Handler_Class:
         ref_num = ref_nums[0]
         
         subj_comments = f"{ref_num}_Comments"
+        # 예고 메일 때 저장한 사건 정보 (KIPRIS 마감기한·재심사 여부·출원인)
+        case = find_case(load_case_cache(), ref_num, OA_DOC_TYPE if rejection_type == "OA" else FR_DOC_TYPE)
         if rejection_type == "OA":
             subj_action = f"{ref_num}_의견서"
         else:
-            subj_action, fr_label, fr_source, fr_warning = fr_action(
-                ref_num, find_case(load_case_cache(), ref_num, FR_DOC_TYPE)
-            )
+            subj_action, fr_label, fr_source, fr_warning = fr_action(ref_num, case)
+        applicant = (case or {}).get("applicant", "")
+        subj_comments = with_applicant(subj_comments, applicant)
+        subj_action = with_applicant(subj_action, applicant)
+        memo = f"출원인: {squash(applicant)}" if squash(applicant) else ""
 
         # 이메일 제목에서 날짜 추출
         date_pattern = r"(\d{4}-\d{2}-\d{2})"
@@ -799,7 +863,6 @@ class Handler_Class:
 
         if rejection_type == "OA":
             # 예고 메일 때 저장한 KIPRIS 마감기한을 쓴다. 없으면 위에서 계산한 값(계산식) 그대로.
-            case = find_oa_case(load_case_cache(), ref_num)
             response_date, action_source, warning = resolve_oa_dates(
                 target_date, response_date, case, date.today()
             )
@@ -812,7 +875,7 @@ class Handler_Class:
         folder_names = ["Mail", "No_Instructions"]
 
         def register(selected):
-            return register_items(folder_names, items, selected, naver_cal.Session())
+            return register_items(folder_names, items, selected, naver_cal.Session(), memo)
 
         if rejection_type == "OA":
             doc_label = "의견제출통지서 (OA)"
@@ -944,6 +1007,35 @@ class MainWin(qtw.QWidget):
 
         settings_main_layout.addLayout(settings_layout)
 
+        # 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
+        abbr_header = qtw.QHBoxLayout()
+        abbr_header.addWidget(qtw.QLabel("출원인 약칭"))
+        abbr_header.addStretch()
+        abbr_hint = qtw.QLabel(f"표에 없으면 자동: 법인 표기·공백 제거 후 앞 {ABBR_LEN}자")
+        abbr_hint.setStyleSheet("color: gray;")
+        abbr_header.addWidget(abbr_hint)
+        settings_main_layout.addLayout(abbr_header)
+
+        self.abbr_table = qtw.QTableWidget(0, 2)
+        self.abbr_table.setHorizontalHeaderLabels(["출원인 국문 명칭", "약칭"])
+        self.abbr_table.horizontalHeader().setSectionResizeMode(0, qtw.QHeaderView.Stretch)
+        self.abbr_table.horizontalHeader().setSectionResizeMode(1, qtw.QHeaderView.ResizeToContents)
+        self.abbr_table.verticalHeader().setVisible(False)
+        self.abbr_table.setSelectionBehavior(qtw.QAbstractItemView.SelectRows)
+        for name, abbr in (config.get("applicant_abbr") or {}).items():
+            self._add_abbr_row(name, abbr)
+        settings_main_layout.addWidget(self.abbr_table, 1)
+
+        abbr_add_btn = qtw.QPushButton("추가")
+        abbr_add_btn.clicked.connect(self.add_abbr_clicked)
+        abbr_del_btn = qtw.QPushButton("삭제")
+        abbr_del_btn.clicked.connect(self.delete_abbr_clicked)
+        abbr_btns = qtw.QHBoxLayout()
+        abbr_btns.addWidget(abbr_add_btn)
+        abbr_btns.addWidget(abbr_del_btn)
+        abbr_btns.addStretch()
+        settings_main_layout.addLayout(abbr_btns)
+
         # 좌측 아이콘 사이드바 + 우측 콘텐츠 스택
         self.stack = qtw.QStackedWidget()
         self.stack.addWidget(self.tab_tasks)
@@ -1057,9 +1149,29 @@ class MainWin(qtw.QWidget):
         if directory:
             self.target_path_edit.setText(directory)
 
+    def _add_abbr_row(self, name="", abbr=""):
+        row = self.abbr_table.rowCount()
+        self.abbr_table.insertRow(row)
+        self.abbr_table.setItem(row, 0, qtw.QTableWidgetItem(name))
+        self.abbr_table.setItem(row, 1, qtw.QTableWidgetItem(abbr))
+        return row
+
+    def add_abbr_clicked(self):
+        row = self._add_abbr_row()
+        self.abbr_table.setCurrentCell(row, 0)
+        self.abbr_table.editItem(self.abbr_table.item(row, 0))
+
+    def delete_abbr_clicked(self):
+        for row in sorted({i.row() for i in self.abbr_table.selectedIndexes()}, reverse=True):
+            self.abbr_table.removeRow(row)
+
     def save_settings_ui(self):
         config["parent_path"] = self.parent_path_edit.text()
         config["target_path"] = self.target_path_edit.text()
+        cell = lambda r, c: self.abbr_table.item(r, c).text() if self.abbr_table.item(r, c) else ""
+        config["applicant_abbr"] = abbr_table_from_rows(
+            (cell(r, 0), cell(r, 1)) for r in range(self.abbr_table.rowCount())
+        )
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}")
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")

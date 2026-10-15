@@ -511,6 +511,28 @@ class TestHandlePrenotice(unittest.TestCase):
         case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
         self.assertEqual((case["app_no"], case["due_date"]), ("10-2025-7000694", ""))
 
+    def test_stores_applicant(self):
+        with patch.object(kipris, "fetch_due_dates", return_value=[]):
+            main.handle_prenotice(self._message())
+        case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
+        self.assertEqual(case["applicant"], "에어 프로덕츠 앤드 케미칼스, 인코오포레이티드")
+
+    def test_fills_applicant_on_old_entry_without_kipris(self):
+        """출원인 저장 전에 받은 행은 KIPRIS 를 부르지 않고 출원인만 채운다"""
+        notices = [kipris.Notice("952026093034069", "의견제출통지서", "2027-02-08")]
+        with patch.object(kipris, "fetch_due_dates", return_value=notices):
+            main.handle_prenotice(self._message())
+        cache = main.load_case_cache()
+        for v in cache.values():
+            v.pop("applicant")
+        main.save_case_cache(cache)
+        with patch.object(kipris, "fetch_due_dates") as fetch:
+            self.assertEqual(main.handle_prenotice(self._message()), 1)
+        fetch.assert_not_called()
+        case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
+        self.assertEqual((case["applicant"], case["due_date"]),
+                         ("에어 프로덕츠 앤드 케미칼스, 인코오포레이티드", "2027-02-08"))
+
     def test_missing_due_retried_on_next_prenotice_pass(self):
         """지난번 조회가 실패한 행은 예고 메일을 다시 처리할 때 다시 조회한다"""
         with patch.object(kipris, "fetch_due_dates", side_effect=kipris.KiprisError("연결 끊김")):
@@ -552,8 +574,52 @@ class TestHandlePrenoticeFr(TestHandlePrenotice):
         self.assertIs(self._case()["reexam"], False)
 
     test_stores_due_date_and_skips_repeat = None
+    test_stores_applicant = None
+    test_fills_applicant_on_old_entry_without_kipris = None
     test_kipris_failure_still_stores_app_no = None
     test_missing_due_retried_on_next_prenotice_pass = None
+
+
+class TestApplicant(unittest.TestCase):
+    """출원인 약칭·제목"""
+
+    def setUp(self):
+        patcher = patch.dict(main.config, {"applicant_abbr": {}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_auto_abbr(self):
+        cases = {
+            "도쿄엘렉트론가부시키가이샤": "도쿄엘렉트론",
+            "에어 프로덕츠 앤드 케미칼스, 인코오포레이티드": "에어프로덕츠",
+            "테크닙 에너지스 프랑스": "테크닙에너지",
+            "폭스바겐 악티엔게젤샤프트": "폭스바겐",
+            "아우디 아게": "아우디",
+            "주식회사 엘지화학": "엘지화학",
+            "가부시키가이샤 덴소": "덴소",
+            "혼다 기켄 고교 가부시키가이샤": "혼다기켄고교",
+        }
+        for name, want in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(main.applicant_abbr(name), want)
+
+    def test_table_wins(self):
+        main.config["applicant_abbr"] = {"도쿄엘렉트론가부시키가이샤": "TEL",
+                                         "에이엠에스-오스람  인터내셔널 게엠베하": "오스람"}
+        self.assertEqual(main.applicant_abbr("도쿄엘렉트론가부시키가이샤"), "TEL")
+        self.assertEqual(main.applicant_abbr(" 에이엠에스-오스람 인터내셔널 게엠베하"), "오스람")
+
+    def test_with_applicant(self):
+        self.assertEqual(main.with_applicant("PA-2T8084_의견서", "에어 프로덕츠 앤드 케미칼스, 인코오포레이티드"),
+                         "PA-2T8084_의견서_에어프로덕츠")
+        self.assertEqual(main.with_applicant("PA-2T8084_의견서", ""), "PA-2T8084_의견서")
+        self.assertEqual(main.with_applicant("PA-2T8084_의견서", None), "PA-2T8084_의견서")
+
+    def test_abbr_table_from_rows(self):
+        rows = [(" 도쿄엘렉트론가부시키가이샤 ", "TEL"), ("빈 약칭", ""), ("", "X"),
+                ("아우디  아게", "AUDI"), ("아우디 아게", "아우디")]
+        self.assertEqual(main.abbr_table_from_rows(rows),
+                         {"도쿄엘렉트론가부시키가이샤": "TEL", "아우디 아게": "아우디"})
 
 
 class TestFrAction(unittest.TestCase):
@@ -626,6 +692,13 @@ class TestNaverRegistration(unittest.TestCase):
         results = self._run(naver, selected=[(1, date(2027, 2, 9))])
         self.assertEqual(results, {1: main.STATUS_ADDED})
         naver.add_all_day.assert_called_once_with("기한", "PA-2T8084_의견서", date(2027, 2, 9), "")
+
+    def test_memo_passed_as_description(self):
+        naver = MagicMock()
+        naver.add_all_day.return_value = True
+        main.register_items(self.NAMES, self.ITEMS, [(0, date(2026, 10, 1))], naver, "출원인: 아우디 아게")
+        naver.add_all_day.assert_called_once_with("코멘트", "PA-2T8084_Comments", date(2026, 10, 1),
+                                                  "출원인: 아우디 아게")
 
     def test_missing_calendar_name_is_error(self):
         main.config["naver_calendars"] = {"Mail": "코멘트"}
