@@ -7,6 +7,8 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
   → %APPDATA%\\ChekPat\\credentials.dat 의 `KIPRIS_API_KEY` 순서. 두 파일은 DPAPI 로 봉인되어 있다.
 - 호출 수: 무료 월 1,000회가 키 단위라 ChekPat 의 settings.json `kipris_calls` 를 같이 센다(상한 900).
 - 응답 필드: `Mailingnumber`(발송번호)·`DocNm`(서류명)·`ExpirationDuedateDate`(연장 반영 마감기한).
+- 「특허·실용 서지 상세」(`/kipo-api/kipi/` 게이트, 키는 `ServiceKey`)로 거절결정이 재심사에 의한 것인지 가린다
+  — `finalDisposal`(「거절결정(일반)」·「거절결정(재심사)」)과 서류 목록(「…보정서(재심사)」).
 """
 
 import json
@@ -24,8 +26,10 @@ from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
 
-BASE_URL = "https://plus.kipris.or.kr/openapi/rest"
+BASE_URL = "https://plus.kipris.or.kr"
+_GATEWAYS = {"openapi": ("openapi/rest", "accessKey"), "kipo": ("kipo-api/kipi", "ServiceKey")}
 DUE_DATE_PATH = "DueDateService/dueDateApplicationNoticeApplnoInfo"
+BIBLIO_PATH = "patUtiModInfoSearchSevice/getBibliographyDetailInfoSearch"   # kipo 게이트에만 있다
 MONTHLY_CAP = 900                    # 무료 1,000회에서 손으로 찾아볼 여유 100회 (ChekPat 과 같음)
 MIN_INTERVAL = 0.1                   # 초. 초당 50회를 넘기면 IP 가 막힌다
 TIMEOUT = 10
@@ -125,7 +129,7 @@ def _find(root, name: str):
     return None
 
 
-def parse_root(xml_text):
+def parse_root(xml_text, product="통지서 마감기한"):
     """응답 XML → 뿌리 요소. 결과 코드가 실패면 KiprisError."""
     try:
         root = ET.fromstring(xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text)
@@ -135,9 +139,9 @@ def parse_root(xml_text):
     msg = _text(_find(root, "resultMsg"))
     success = _text(_find(root, "successYN")).upper()
     if code == "101":
-        raise KiprisError("KIPRIS Plus 에서 「통지서 마감기한」 상품을 신청하지 않았습니다 (결과 코드 101).")
+        raise KiprisError(f"KIPRIS Plus 에서 「{product}」 상품을 신청하지 않았습니다 (결과 코드 101).")
     if code == "31" or "DEADLINE_HAS_EXPIRED" in msg.upper():
-        raise KiprisError("KIPRIS Plus 「통지서 마감기한」 상품의 이용기간이 끝났습니다 (결과 코드 31).")
+        raise KiprisError(f"KIPRIS Plus 「{product}」 상품의 이용기간이 끝났습니다 (결과 코드 31).")
     if code == "30" or re.search(r"SERVICE[\s_]*KEY[\s_]*IS[\s_]*NOT[\s_]*REGISTER", msg, re.I):
         raise KiprisError(f"KIPRIS Plus 키가 맞지 않거나 상품을 신청하지 않았습니다 (결과 코드 {code or '?'}: {msg}).")
     if success == "N" or code not in ("", "0", "00"):
@@ -198,6 +202,21 @@ def parse_due_dates(xml_text) -> List[Notice]:
     return out
 
 
+def parse_reexam(xml_text) -> bool:
+    """서지 상세 응답 XML → 이 출원의 거절결정이 재심사에 의한 것인가.
+
+    최종처분이 「거절결정(일반)」 이면 아니다. 「거절결정(재심사)」 나 KIPRIS 반영이 늦어 아직
+    「거절결정 후 재심사중」 이면 그렇다. 최종처분으로 알 수 없으면 재심사 보정서를 낸 적이 있는지로 본다.
+    """
+    root = parse_root(xml_text, "특허·실용 서지 상세")
+    disposal = _text(_find(root, "finalDisposal"))
+    if "(일반)" in disposal:
+        return False
+    if "재심사" in disposal:
+        return True
+    return any("보정서(재심사)" in _text(el) for el in root.iter() if _local(el.tag).lower() == "documentname")
+
+
 def pick_oa_due(notices: List[Notice], doc_type: str) -> Optional[Notice]:
     """서류명에 문서종류가 들어간 통지서 가운데 가장 최신(발송번호 숫자가 가장 큰) 것."""
     cands = [n for n in notices if doc_type and doc_type in n.title and n.due_date]
@@ -233,11 +252,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def _send(path: str, params: dict) -> str:
+def _send(path: str, params: dict, gateway: str = "openapi") -> str:
     key = api_key()
     if not key:
         raise KiprisError("KIPRIS Plus 키가 없습니다 (ChekPat 연결 설정 또는 환경변수 KIPRIS_API_KEY).")
-    url = f"{BASE_URL}/{path}?" + urllib.parse.urlencode({**params, "accessKey": key})
+    prefix, key_param = _GATEWAYS[gateway]
+    url = f"{BASE_URL}/{prefix}/{path}?" + urllib.parse.urlencode({**params, key_param: key})
     for attempt in range(2):  # 연결이 끊기는 일시 오류(ConnectionResetError 등)는 한 번 더 보낸다
         _count_call()
         _acquire()
@@ -261,3 +281,11 @@ def fetch_due_dates(appln: str) -> List[Notice]:
     if not num:
         raise KiprisError(f"출원번호를 알아볼 수 없습니다: {appln}")
     return parse_due_dates(_send(DUE_DATE_PATH, {"applicationNumber": num}))
+
+
+def fetch_reexam(appln: str) -> bool:
+    """출원번호의 거절결정이 재심사에 의한 것인가 (서지 상세 호출 1회). 실패하면 KiprisError."""
+    num = appln_number(appln)
+    if not num:
+        raise KiprisError(f"출원번호를 알아볼 수 없습니다: {appln}")
+    return parse_reexam(_send(BIBLIO_PATH, {"applicationNumber": num}, gateway="kipo"))

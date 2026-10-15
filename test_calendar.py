@@ -360,6 +360,20 @@ PRENOTICE_BODY = (
     "20261012\t10-2025-7000694\tPA-2T8084\t신용석\t에어 프로덕츠 앤드 케미칼스, 인코오포레이티드\t의견제출통지서\r\n"
 )
 
+FR_PRENOTICE_BODY = (
+    "아래 사건의 담당자를 지정합니다.\r\n"
+    "20261012\t10-2014-0049963\tPA-2T9001\t신용석\t폭스바겐 악티엔게젤샤프트\t거절결정서\r\n"
+)
+
+
+def biblio_xml(disposal="", documents=()):
+    """서지 상세 응답 (CPProject records.parse_biblio 가 읽는 모양)."""
+    docs = "".join(f"<legalStatusInfo><documentName>{d}</documentName></legalStatusInfo>" for d in documents)
+    return ("<response><header><successYN>Y</successYN><resultCode>00</resultCode></header><body><item>"
+            f"<biblioSummaryInfoArray><biblioSummaryInfo><finalDisposal>{disposal}</finalDisposal>"
+            f"</biblioSummaryInfo></biblioSummaryInfoArray><legalStatusInfoArray>{docs}</legalStatusInfoArray>"
+            "</item></body></response>")
+
 DUE_DATE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <response><header><successYN>Y</successYN><resultCode>00</resultCode><resultMsg>NORMAL SERVICE.</resultMsg></header>
 <body><items>
@@ -507,6 +521,58 @@ class TestHandlePrenotice(unittest.TestCase):
         fetch.assert_called_once()
         case = main.find_oa_case(main.load_case_cache(), "PA-2T8084")
         self.assertEqual(case["due_date"], "2027-02-08")
+
+
+class TestHandlePrenoticeFr(TestHandlePrenotice):
+    """거절결정서 행 — 재심사에 의한 거절결정인지 KIPRIS 서지 상세 1회 조회"""
+
+    def _message(self):
+        message = super()._message()
+        message.Body = FR_PRENOTICE_BODY
+        return message
+
+    def _case(self):
+        return main.find_case(main.load_case_cache(), "PA-2T9001", main.FR_DOC_TYPE)
+
+    def test_stores_reexam_and_skips_repeat(self):
+        with patch.object(kipris, "fetch_reexam", return_value=True) as fetch,                 patch.object(kipris, "fetch_due_dates") as due:
+            self.assertEqual(main.handle_prenotice(self._message()), 1)
+            self.assertEqual(main.handle_prenotice(self._message()), 0)
+        fetch.assert_called_once_with("10-2014-0049963")
+        due.assert_not_called()
+        self.assertIs(self._case()["reexam"], True)
+
+    def test_failure_retried_next_pass(self):
+        with patch.object(kipris, "fetch_reexam", side_effect=kipris.KiprisError("연결 끊김")):
+            main.handle_prenotice(self._message())
+        self.assertNotIn("reexam", self._case())
+        with patch.object(kipris, "fetch_reexam", return_value=False) as fetch:
+            self.assertEqual(main.handle_prenotice(self._message()), 1)
+        fetch.assert_called_once()
+        self.assertIs(self._case()["reexam"], False)
+
+    test_stores_due_date_and_skips_repeat = None
+    test_kipris_failure_still_stores_app_no = None
+    test_missing_due_retried_on_next_prenotice_pass = None
+
+
+class TestFrAction(unittest.TestCase):
+    """거절결정서 Action 일정 제목"""
+
+    def test_reexam(self):
+        subj, label, _src, warn = main.fr_action("PA-2T9001", {"reexam": True})
+        self.assertEqual((subj, label, warn), ("PA-2T9001_거결불", "재심사 거절결정서 (FR)", ""))
+
+    def test_general(self):
+        subj, _label, _src, warn = main.fr_action("PA-2T9001", {"reexam": False})
+        self.assertEqual((subj, warn), ("PA-2T9001_재심사", ""))
+
+    def test_unknown_warns(self):
+        for case in (None, {"app_no": "10-2014-0049963"}):
+            with self.subTest(case=case):
+                subj, _label, _src, warn = main.fr_action("PA-2T9001", case)
+                self.assertEqual(subj, "PA-2T9001_재심사")
+                self.assertIn("_거결불", warn)
 
 
 class TestScheduleRegistration(unittest.TestCase):
@@ -760,6 +826,23 @@ class TestKipris(unittest.TestCase):
     def test_not_xml_raises(self):
         with self.assertRaises(kipris.KiprisError):
             kipris.parse_due_dates("<html>code400")
+
+    def test_parse_reexam(self):
+        cases = [
+            (biblio_xml("거절결정(일반)", ["거절결정서"]), False),
+            (biblio_xml("거절결정(재심사)", ["거절결정서", "[명세서등 보정]보정서(재심사)", "거절결정서"]), True),
+            (biblio_xml("거절결정 후 재심사중", ["거절결정서", "[명세서등 보정]보정서(재심사)"]), True),
+            (biblio_xml("", ["의견제출통지서", "[명세서등 보정]보정서(재심사)"]), True),
+            (biblio_xml("", ["의견제출통지서", "[명세서등 보정]보정서"]), False),
+        ]
+        for xml, want in cases:
+            with self.subTest(xml=xml):
+                self.assertIs(kipris.parse_reexam(xml), want)
+
+    def test_parse_reexam_result_code_names_product(self):
+        xml = "<response><header><resultCode>101</resultCode></header></response>"
+        with self.assertRaisesRegex(kipris.KiprisError, "서지 상세"):
+            kipris.parse_reexam(xml)
 
     def test_appln_number(self):
         self.assertEqual(kipris.appln_number("10-2025-7000694"), "1020257000694")

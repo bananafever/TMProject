@@ -327,6 +327,7 @@ _RECEIPT_CELL = re.compile(r"\d{8}")
 _APP_NO_CELL = re.compile(r"\d{2}-\d{4}-\d{7}")
 _PRENOTICE_CELLS = 6
 OA_DOC_TYPE = "의견제출통지서"  # 「최후의견제출통지서」도 이 글자를 포함한다
+FR_DOC_TYPE = "거절결정"        # 「거절결정서」·「특허거절결정서」 어느 쪽이든
 CASE_CACHE_FILE = "case_cache.json"
 CASE_CACHE_KEEP_DAYS = 183
 PRENOTICE_SCAN_DAYS = 14
@@ -393,20 +394,26 @@ def save_case_cache(cache, today=None):
         logging.error(f"사건 캐시 저장 실패: {e}")
 
 
-def find_oa_case(cache, ref_num):
-    """Ref 의 의견제출통지서 항목 가운데 접수일이 가장 늦은 것. 없으면 None."""
+def find_case(cache, ref_num, doc_word):
+    """Ref 의 항목 가운데 문서종류에 doc_word 가 들어간 것 중 접수일이 가장 늦은 것. 없으면 None."""
     cands = [
         v for k, v in cache.items()
-        if k.split("|", 1)[0] == ref_num and OA_DOC_TYPE in (v.get("doc_type") or "")
+        if k.split("|", 1)[0] == ref_num and doc_word in (v.get("doc_type") or "")
     ]
     return max(cands, key=lambda v: v.get("receipt_date") or "") if cands else None
 
 
+def find_oa_case(cache, ref_num):
+    """Ref 의 의견제출통지서 항목 가운데 접수일이 가장 늦은 것. 없으면 None."""
+    return find_case(cache, ref_num, OA_DOC_TYPE)
+
+
 def handle_prenotice(message):
-    """예고 메일 한 통을 처리합니다. 의견제출통지서 행은 KIPRIS 마감기한을 1회 조회해 함께 저장합니다.
+    """예고 메일 한 통을 처리합니다. 의견제출통지서 행은 KIPRIS 마감기한을, 거절결정서 행은 재심사에 의한
+    거절결정인지를 KIPRIS 에 1회 조회해 함께 저장합니다.
 
     이미 같은 내용(Ref·문서종류·출원번호·접수일)으로 저장된 행은 건너뜁니다(KIPRIS 다시 부르지 않음).
-    단 의견제출통지서인데 마감기한을 아직 못 받은 행은 다시 조회합니다(지난번 조회 실패·KIPRIS 미반영).
+    단 의견제출통지서인데 마감기한을, 거절결정서인데 재심사 여부를 아직 못 받은 행은 다시 조회합니다.
     반환값: 새로 저장(또는 갱신)한 행 수
     """
     rows = parse_prenotice_rows(message.Body, config["prenotice_assignee"])
@@ -421,8 +428,9 @@ def handle_prenotice(message):
         key = _case_key(row["ref"], row["doc_type"])
         old = cache.get(key)
         is_oa = OA_DOC_TYPE in row["doc_type"]
+        is_fr = FR_DOC_TYPE in row["doc_type"]
         same = old and old.get("app_no") == row["app_no"] and old.get("receipt_date") == row["receipt_date"]
-        if same and (old.get("due_date") or not is_oa):
+        if same and (old.get("due_date") if is_oa else ("reexam" in old if is_fr else True)):
             continue
 
         entry = {
@@ -445,6 +453,12 @@ def handle_prenotice(message):
                     )
                 else:
                     logging.info(f"KIPRIS 에 {row['doc_type']} 마감기한이 아직 없습니다: {row['ref']} {row['app_no']}")
+            except kipris.KiprisError as e:
+                logging.error(f"KIPRIS 조회 실패 ({row['ref']} {row['app_no']}): {e}")
+        elif is_fr:
+            try:
+                entry["reexam"] = kipris.fetch_reexam(row["app_no"])
+                logging.info(f"KIPRIS 재심사 거절결정 여부: {row['ref']} {row['app_no']} → {entry['reexam']}")
             except kipris.KiprisError as e:
                 logging.error(f"KIPRIS 조회 실패 ({row['ref']} {row['app_no']}): {e}")
 
@@ -478,6 +492,20 @@ def scan_prenotices(outlook, days=PRENOTICE_SCAN_DAYS):
             handle_prenotice(message)
         except Exception as e:
             logging.error(f"예고 메일 처리 실패: {e}")
+
+
+def fr_action(ref_num, case):
+    """거절결정서 Action 일정 제목을 정합니다. 예고 메일 때 저장한 재심사 여부만 씁니다.
+
+    반환값: (subject, doc_label, source_text, warning)
+    """
+    reexam = (case or {}).get("reexam")
+    if reexam is True:
+        return f"{ref_num}_거결불", "재심사 거절결정서 (FR)", "재심사에 의한 거절결정 (KIPRIS)", ""
+    if reexam is False:
+        return f"{ref_num}_재심사", "거절결정서 (FR)", "일반 거절결정 (KIPRIS)", ""
+    return (f"{ref_num}_재심사", "거절결정서 (FR)", "⚠ 재심사 여부 확인 불가",
+            "재심사 여부를 확인하지 못했습니다 — 재심사에 의한 거절결정이면 네이버 캘린더에서 제목을 _거결불 로 고치세요.")
 
 
 def resolve_oa_dates(mail_date, fallback_date, case, today):
@@ -743,7 +771,9 @@ class Handler_Class:
         if rejection_type == "OA":
             subj_action = f"{ref_num}_의견서"
         else:
-            subj_action = f"{ref_num}_재심사"
+            subj_action, fr_label, fr_source, fr_warning = fr_action(
+                ref_num, find_case(load_case_cache(), ref_num, FR_DOC_TYPE)
+            )
 
         # 이메일 제목에서 날짜 추출
         date_pattern = r"(\d{4}-\d{2}-\d{2})"
@@ -791,8 +821,9 @@ class Handler_Class:
             else:
                 source_text = "⚠ KIPRIS 마감기한 사용 불가 → 계산식 적용 (날짜를 확인하세요)"
         else:
-            doc_label = "거절결정서 (FR)"
-            source_text = "청서류 기한: 계산식 (수신일 + 3개월)"
+            doc_label = fr_label
+            source_text = f"{fr_source} · 청서류 기한: 계산식 (수신일 + 3개월)"
+            warning = fr_warning
 
         # 날짜를 고칠 수 없으면 바로 등록하고 결과를 알림창에 보여 준다.
         # 고칠 수 있으면(OA + KIPRIS 사용 불가) 알림창에서 확인·수정한 뒤 [등록] — 결과는 같은 창에 표시.
