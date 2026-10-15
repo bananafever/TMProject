@@ -27,6 +27,7 @@ from dateutil.relativedelta import relativedelta  # noqa: E402
 
 import kipris  # noqa: E402
 import naver_cal  # noqa: E402
+import naver_sync  # noqa: E402
 import main  # noqa: E402  (mock 설정 후 import)
 from main import _extract_message_info, ref_num_key  # noqa: E402
 
@@ -607,6 +608,10 @@ class TestNaverCal(unittest.TestCase):
         self.assertIn("SUMMARY:PA-2T8084_의견서\r\n", unfolded)
         self.assertIn("DESCRIPTION:a\\;b\\,c\\\\d\\n줄\r\n", unfolded)
 
+    def test_empty_body_has_no_description(self):
+        ics = naver_cal.build_ics("u@tmproject", "제목", date(2027, 1, 1), "")
+        self.assertNotIn("DESCRIPTION", ics)
+
     def test_long_lines_folded_by_octets(self):
         ics = naver_cal.build_ics("u@tmproject", "제목", date(2027, 1, 1), "가" * 200)
         for line in ics.split("\r\n"):
@@ -661,6 +666,15 @@ class TestNaverCal(unittest.TestCase):
         self.assertTrue(url.startswith("https://caldav.calendar.naver.com/calendars/me/a/"))
         self.assertTrue(url.endswith(".ics"))
 
+    def test_exists_reads_only(self):
+        s = naver_cal.Session("id", "pw")
+        calls = self._fake(s, existing=True)
+        self.assertTrue(s.exists("기한", "x", date(2027, 2, 8)))
+        s = naver_cal.Session("id", "pw")
+        calls = self._fake(s)
+        self.assertFalse(s.exists("기한", "x", date(2027, 2, 8)))
+        self.assertEqual([m for m, _u in calls if m not in ("PROPFIND",)], ["GET"])
+
     def test_existing_or_412_is_duplicate(self):
         s = naver_cal.Session("id", "pw")
         calls = self._fake(s, existing=True)
@@ -688,6 +702,28 @@ class TestNaverCal(unittest.TestCase):
         with patch.object(naver_cal, "credentials", return_value=None):
             with self.assertRaises(naver_cal.NaverError):
                 naver_cal.Session().calendars()
+
+
+class TestNaverSync(unittest.TestCase):
+    """Outlook 하위 캘린더 → 같은 이름의 네이버 캘린더"""
+
+    @staticmethod
+    def _item(subject, start, all_day=True):
+        item = MagicMock()
+        item.Subject, item.Start, item.AllDayEvent = subject, start, all_day
+        return item
+
+    def test_outlook_events_since_and_folder(self):
+        folders = {
+            "Mail": [self._item("A_Comments", datetime(2026, 10, 15)), self._item("B_Comments", datetime(2026, 10, 16))],
+            "Complete": [self._item("C_의견서", datetime(2026, 11, 1, 10, 30), all_day=False)],
+        }
+        calendar = MagicMock()
+        calendar.Folders.__getitem__.side_effect = lambda name: MagicMock(Items=MagicMock(
+            __iter__=lambda _self: iter(folders[name])))
+        events = naver_sync.outlook_events(calendar, date(2026, 10, 16), folders=["Mail", "Complete"])
+        self.assertEqual(events, [("Mail", "B_Comments", date(2026, 10, 16), True),
+                                  ("Complete", "C_의견서", date(2026, 11, 1), False)])
 
 
 class TestKipris(unittest.TestCase):

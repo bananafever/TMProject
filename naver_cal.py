@@ -112,7 +112,7 @@ def build_ics(uid: str, subject: str, day: date, body: str, now: Optional[dateti
         f"DTSTART;VALUE=DATE:{day:%Y%m%d}",
         f"DTEND;VALUE=DATE:{day + timedelta(days=1):%Y%m%d}",
         f"SUMMARY:{_escape(subject)}",
-        f"DESCRIPTION:{_escape(body)}",
+        *([f"DESCRIPTION:{_escape(body)}"] if body else []),
         "TRANSP:TRANSPARENT",
         "END:VEVENT",
         "END:VCALENDAR",
@@ -232,16 +232,23 @@ class Session:
             self._error = e
             raise
 
-    def add_all_day(self, calendar_name: str, subject: str, day: date, body: str) -> bool:
-        """종일 일정 하나. 추가했으면 True, 이미 있으면 False. 실패하면 NaverError."""
+    def _event_url(self, calendar_name: str, uid: str) -> str:
         url = self.calendars().get(calendar_name)
         if not url:
             raise NaverError(f"네이버 캘린더 「{calendar_name}」 가 없습니다.")
-        uid = make_uid(calendar_name, subject, day)
-        event_url = event_url_for(url, uid)
-        status, _final, _text = self._request("GET", event_url)
-        if status != 404:
+        return event_url_for(url, uid)
+
+    def exists(self, calendar_name: str, subject: str, day: date) -> bool:
+        """이 앱이 같은 캘린더·제목·날짜로 등록한 일정이 이미 있는가 (읽기만 함)."""
+        status, _final, _text = self._request("GET", self._event_url(calendar_name, make_uid(calendar_name, subject, day)))
+        return status != 404
+
+    def add_all_day(self, calendar_name: str, subject: str, day: date, body: str) -> bool:
+        """종일 일정 하나. 추가했으면 True, 이미 있으면 False. 실패하면 NaverError."""
+        if self.exists(calendar_name, subject, day):
             return False
+        uid = make_uid(calendar_name, subject, day)
+        event_url = self._event_url(calendar_name, uid)
         status, _final, _text = self._request("PUT", event_url, build_ics(uid, subject, day, body), {
             "Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"})
         if status == 412:
