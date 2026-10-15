@@ -26,6 +26,7 @@ sys.modules["PySide6.QtCore"] = MagicMock()
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
 import kipris  # noqa: E402
+import naver_cal  # noqa: E402
 import main  # noqa: E402  (mock 설정 후 import)
 from main import _extract_message_info, ref_num_key  # noqa: E402
 
@@ -532,6 +533,156 @@ class TestScheduleRegistration(unittest.TestCase):
             status = main._register_appointment(folder, "PA-2T8084_의견서", date(2027, 2, 8), "본문")
         self.assertEqual(status, main.STATUS_DUPLICATE)
         folder.Items.Add.assert_not_called()
+
+
+class TestNaverRegistration(unittest.TestCase):
+    """Outlook 등록과 함께 네이버 캘린더에도 등록"""
+
+    ITEMS = [("Comments", "PA-2T8084_Comments", date(2026, 10, 1)),
+             ("Action", "PA-2T8084_의견서", date(2027, 2, 8))]
+    NAMES = ["Mail", "No_Instructions"]
+    SELECTED = [(0, date(2026, 10, 1)), (1, date(2027, 2, 8))]
+
+    def setUp(self):
+        patcher = patch.dict(main.config, {"naver_calendars": {"Mail": "코멘트", "No_Instructions": "기한"}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(main, "_register_appointment", return_value=main.STATUS_ADDED)
+        self.outlook = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _run(self, naver):
+        return main.register_items([MagicMock(), MagicMock()], self.NAMES, self.ITEMS, "본문", self.SELECTED, naver)
+
+    def test_naver_off_only_outlook(self):
+        results = self._run(None)
+        self.assertEqual(results, {0: (main.STATUS_ADDED, None), 1: (main.STATUS_ADDED, None)})
+
+    def test_naver_each_folder_to_its_calendar(self):
+        naver = MagicMock()
+        naver.add_all_day.side_effect = [True, False]
+        results = self._run(naver)
+        self.assertEqual(results, {0: (main.STATUS_ADDED, main.STATUS_ADDED),
+                                   1: (main.STATUS_ADDED, main.STATUS_DUPLICATE)})
+        calls = [c.args[0] for c in naver.add_all_day.call_args_list]
+        self.assertEqual(calls, ["코멘트", "기한"])
+
+    def test_naver_failure_keeps_outlook(self):
+        naver = MagicMock()
+        naver.add_all_day.side_effect = naver_cal.NaverError("네이버 인증 실패")
+        results = self._run(naver)
+        self.assertEqual(self.outlook.call_count, 2)
+        for outlook, naver_status in results.values():
+            self.assertEqual(outlook, main.STATUS_ADDED)
+            self.assertTrue(naver_status.startswith("오류"))
+
+    def test_missing_calendar_name_is_error(self):
+        main.config["naver_calendars"] = {"Mail": "코멘트"}
+        naver = MagicMock()
+        naver.add_all_day.return_value = True
+        results = self._run(naver)
+        self.assertEqual(results[0][1], main.STATUS_ADDED)
+        self.assertTrue(results[1][1].startswith("오류"))
+
+
+class TestNaverCal(unittest.TestCase):
+    """naver_cal — iCalendar 만들기와 CalDAV 흐름 (네트워크는 가짜)"""
+
+    def test_uid_deterministic(self):
+        a = naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 8))
+        self.assertEqual(a, naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 8)))
+        self.assertNotEqual(a, naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 9)))
+
+    def test_all_day_ics(self):
+        ics = naver_cal.build_ics("u@tmproject", "PA-2T8084_의견서", date(2027, 12, 31), "a;b,c\\d\r\n줄",
+                                  now=datetime(2026, 10, 15, 3, 0, 0))
+        unfolded = ics.replace("\r\n ", "")
+        self.assertIn("DTSTART;VALUE=DATE:20271231\r\n", unfolded)
+        self.assertIn("DTEND;VALUE=DATE:20280101\r\n", unfolded)
+        self.assertIn("SUMMARY:PA-2T8084_의견서\r\n", unfolded)
+        self.assertIn("DESCRIPTION:a\\;b\\,c\\\\d\\n줄\r\n", unfolded)
+
+    def test_long_lines_folded_by_octets(self):
+        ics = naver_cal.build_ics("u@tmproject", "제목", date(2027, 1, 1), "가" * 200)
+        for line in ics.split("\r\n"):
+            self.assertLessEqual(len(line.encode("utf-8")), 75)
+        self.assertIn("가" * 200, ics.replace("\r\n ", ""))
+
+    MULTI = """<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">{}</d:multistatus>"""
+
+    def _fake(self, session, put_status=201, existing=False):
+        principal = self.MULTI.format('<d:response><d:href>/</d:href><d:propstat><d:prop>'
+                                      '<d:current-user-principal><d:href>/principals/me/</d:href></d:current-user-principal>'
+                                      '</d:prop></d:propstat></d:response>')
+        home = self.MULTI.format('<d:response><d:href>/principals/me/</d:href><d:propstat><d:prop>'
+                                 '<c:calendar-home-set><d:href>/calendars/me/</d:href></c:calendar-home-set>'
+                                 '</d:prop></d:propstat></d:response>')
+        cals = self.MULTI.format(
+            '<d:response><d:href>/calendars/me/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype>'
+            '</d:prop></d:propstat></d:response>'
+            '<d:response><d:href>/calendars/me/a</d:href><d:propstat><d:prop><d:displayname>기한</d:displayname>'
+            '<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>'
+            '<c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>'
+            '</d:prop></d:propstat></d:response>'
+            '<d:response><d:href>/calendars/me/todo/</d:href><d:propstat><d:prop><d:displayname>할 일</d:displayname>'
+            '<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>'
+            '<c:supported-calendar-component-set><c:comp name="VTODO"/></c:supported-calendar-component-set>'
+            '</d:prop></d:propstat></d:response>')
+        calls = []
+
+        def request(method, url, body="", headers=None):
+            calls.append((method, url))
+            if method == "PROPFIND":
+                text = {naver_cal.BASE_URL: principal}.get(url) or (home if "principals" in url else cals)
+                return 207, url, text
+            if method == "GET":
+                return (200 if existing else 404), url, ""
+            return put_status, url, ""
+
+        session._request = request
+        return calls
+
+    def test_calendars_only_vevent(self):
+        s = naver_cal.Session("id", "pw")
+        self._fake(s)
+        self.assertEqual(s.calendars(), {"기한": "https://caldav.calendar.naver.com/calendars/me/a/"})
+
+    def test_add_puts_event(self):
+        s = naver_cal.Session("id", "pw")
+        calls = self._fake(s)
+        self.assertTrue(s.add_all_day("기한", "PA-2T8084_의견서", date(2027, 2, 8), "본문"))
+        method, url = calls[-1]
+        self.assertEqual(method, "PUT")
+        self.assertTrue(url.startswith("https://caldav.calendar.naver.com/calendars/me/a/"))
+        self.assertTrue(url.endswith(".ics"))
+
+    def test_existing_or_412_is_duplicate(self):
+        s = naver_cal.Session("id", "pw")
+        calls = self._fake(s, existing=True)
+        self.assertFalse(s.add_all_day("기한", "x", date(2027, 2, 8), ""))
+        self.assertNotIn("PUT", [m for m, _u in calls])
+        s = naver_cal.Session("id", "pw")
+        self._fake(s, put_status=412)
+        self.assertFalse(s.add_all_day("기한", "x", date(2027, 2, 8), ""))
+
+    def test_unknown_calendar_raises(self):
+        s = naver_cal.Session("id", "pw")
+        self._fake(s)
+        with self.assertRaises(naver_cal.NaverError):
+            s.add_all_day("없는 캘린더", "x", date(2027, 2, 8), "")
+
+    def test_discovery_error_cached(self):
+        s = naver_cal.Session("id", "pw")
+        s._request = MagicMock(side_effect=naver_cal.NaverError("연결 실패"))
+        for _ in range(2):
+            with self.assertRaises(naver_cal.NaverError):
+                s.add_all_day("기한", "x", date(2027, 2, 8), "")
+        self.assertEqual(s._request.call_count, 1)
+
+    def test_no_credentials_raises(self):
+        with patch.object(naver_cal, "credentials", return_value=None):
+            with self.assertRaises(naver_cal.NaverError):
+                naver_cal.Session().calendars()
 
 
 class TestKipris(unittest.TestCase):

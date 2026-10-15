@@ -32,6 +32,7 @@ from PySide6 import QtWidgets as qtw
 from PySide6 import QtSvg as qts
 
 import kipris
+import naver_cal
 
 # 로깅 설정
 logging.basicConfig(
@@ -52,6 +53,8 @@ DEFAULT_CONFIG = {
     "parent_path": r"C:/Dropbox/1_Project/Tasks",
     "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review",
     "prenotice_assignee": "신용석",  # 예고 메일 표에서 읽을 담당자
+    "naver_enabled": False,  # 네이버 캘린더에도 등록 (계정: python naver_cal.py --setup)
+    "naver_calendars": {"Mail": "", "No_Instructions": ""},  # Outlook 폴더 → 네이버 캘린더 이름
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -542,6 +545,34 @@ def _register_appointment(folder, subject, day, body):
     return STATUS_ADDED
 
 
+def _register_naver(session, folder_name, subject, day, body):
+    """같은 일정을 네이버 캘린더에도 등록합니다. 실패해도 예외 대신 「오류: …」 를 돌려줍니다."""
+    calendar_name = (config.get("naver_calendars") or {}).get(folder_name, "")
+    try:
+        if not calendar_name:
+            raise naver_cal.NaverError(f"settings.json 의 naver_calendars 에 「{folder_name}」 캘린더 이름이 없습니다.")
+        added = session.add_all_day(calendar_name, subject, day, body)
+    except Exception as e:
+        logging.error(f"네이버 캘린더 일정 등록 실패: {subject} ({day}) — {e}")
+        return f"오류: {e}"
+    status = STATUS_ADDED if added else STATUS_DUPLICATE
+    logging.info(f"네이버 캘린더 일정 {status}: {subject} ({day}) → {calendar_name}")
+    return status
+
+
+def register_items(folders, folder_names, items, body, selected, naver=None):
+    """고른 일정을 Outlook 에 (naver 세션이 있으면 네이버에도) 등록합니다.
+
+    반환값: {index: (Outlook 결과, 네이버 결과 또는 None)}
+    """
+    results = {}
+    for i, day in selected:
+        subject = items[i][1]
+        outlook = _register_appointment(folders[i], subject, day, body)
+        results[i] = (outlook, _register_naver(naver, folder_names[i], subject, day, body) if naver else None)
+    return results
+
+
 class ScheduleDialog(qtw.QDialog):
     """캘린더 등록 알림창 — 날짜·출처(KIPRIS 사용 여부)·등록 결과를 한 창에 보여 줍니다.
 
@@ -554,13 +585,13 @@ class ScheduleDialog(qtw.QDialog):
                  editable=False, register=None, results=None):
         super().__init__(parent)
         self.setWindowTitle("캘린더 등록")
-        self.resize(460, 260)
+        self.resize(560, 260)
 
         self.items = list(items)        # [(그룹 제목, 일정 제목, 날짜), ...]
         self.editable = editable
-        self.register = register        # [(index, 날짜), ...] -> {index: 결과}
+        self.register = register        # [(index, 날짜), ...] -> {index: (Outlook 결과, 네이버 결과|None)}
         self.registered = bool(results)
-        self.checks, self.date_edits, self.result_labels = [], [], []
+        self.checks, self.date_edits, self.result_labels, self.naver_labels = [], [], [], []
 
         layout = qtw.QVBoxLayout(self)
 
@@ -605,6 +636,11 @@ class ScheduleDialog(qtw.QDialog):
             row.addWidget(result)
             self.result_labels.append(result)
 
+            naver = qtw.QLabel()
+            naver.setVisible(False)
+            row.addWidget(naver)
+            self.naver_labels.append(naver)
+
             group.setLayout(row)
             layout.addWidget(group)
 
@@ -628,12 +664,20 @@ class ScheduleDialog(qtw.QDialog):
         self.btn_cancel.setVisible(editable)
         self.btn_close.setVisible(not editable)
 
+    @staticmethod
+    def _status_color(status):
+        return "#1E6B3A" if status == STATUS_ADDED else "#C0392B" if status.startswith("오류") else "#6B6B6B"
+
     def _show_results(self, results):
-        for i, label in enumerate(self.result_labels):
-            status = results.get(i, "등록 안 함")
+        for i, (label, naver_label) in enumerate(zip(self.result_labels, self.naver_labels)):
+            status, naver = results.get(i, ("등록 안 함", None))
             label.setText(status)
-            color = "#1E6B3A" if status == STATUS_ADDED else "#C0392B" if status.startswith("오류") else "#6B6B6B"
-            label.setStyleSheet(f"color: {color};")
+            label.setStyleSheet(f"color: {self._status_color(status)};")
+            naver_label.setVisible(naver is not None)
+            if naver is not None:
+                naver_label.setText(f"네이버: {naver}")
+                naver_label.setToolTip(naver)
+                naver_label.setStyleSheet(f"color: {self._status_color(naver)};")
 
     def _on_register(self):
         selected = [
@@ -644,7 +688,7 @@ class ScheduleDialog(qtw.QDialog):
             results = self.register(selected) if selected else {}
         except Exception as e:
             logging.error(f"캘린더 일정 등록 실패: {e}", exc_info=True)
-            results = {i: f"오류: {e}" for i, _day in selected}
+            results = {i: (f"오류: {e}", None) for i, _day in selected}
         self.registered = True
         self._show_results(results)
 
@@ -766,10 +810,12 @@ class Handler_Class:
             ("Action 일정 (Folder: No_Instructions)", subj_action, response_date),
         ]
         folders = [subfolder, subfolder2]
+        folder_names = [subfolder_name, subfolder2_name]
         body = f"Task details: {message.Body}"
 
         def register(selected):
-            return {i: _register_appointment(folders[i], items[i][1], day, body) for i, day in selected}
+            naver = naver_cal.Session() if config.get("naver_enabled") else None
+            return register_items(folders, folder_names, items, body, selected, naver)
 
         if rejection_type == "OA":
             doc_label = "의견제출통지서 (OA)"
