@@ -164,9 +164,18 @@ def setup_app_fonts(app):
 
     font = app.font()
     font.setFamily("Pretendard")
+    font.setPointSize(10)  # 스타일시트 QWidget { font-size: 10pt } 와 같게
     font.setStyleStrategy(qtg.QFont.PreferAntialias)
     font.setHintingPreference(qtg.QFont.PreferNoHinting)
     app.setFont(font)
+
+
+def use_app_font(*widgets):
+    """표·헤더는 Windows 의 item-view 기본 글꼴에서 출발해 힌팅 끔을 물려받지 못한다.
+    그대로 두면 Pretendard 의 일부 글자(「프」·「츠」·「-」)만 굵게 그려지므로 앱 글꼴을 직접 준다."""
+    font = qtw.QApplication.font()
+    for widget in widgets:
+        widget.setFont(font)
 
 
 def create_dir_if_not_exists(directory):
@@ -1082,6 +1091,8 @@ class StartupSummaryDialog(qtw.QDialog):
         layout = qtw.QVBoxLayout(self)
         layout.addWidget(qtw.QLabel("앱이 꺼져 있던 동안 받은 위임 메일과 지난번 실패한 일정을 등록했습니다."))
         table = qtw.QTableWidget(len(rows), 4)
+        use_app_font(table, table.horizontalHeader())
+        table.setWordWrap(False)
         table.setHorizontalHeaderLabels(["Ref", "일정 제목", "날짜", "결과"])
         table.horizontalHeader().setSectionResizeMode(1, qtw.QHeaderView.Stretch)
         table.verticalHeader().setVisible(False)
@@ -1226,14 +1237,7 @@ class MainWin(qtw.QWidget):
         settings_main_layout = qtw.QVBoxLayout(self.tab_settings)
         settings_main_layout.setContentsMargins(18, 18, 18, 18)
         settings_main_layout.setSpacing(12)
-
-        save_settings_btn = qtw.QPushButton("Save Settings")
-        save_settings_btn.clicked.connect(self.save_settings_ui)
-
-        btn_layout_settings = qtw.QHBoxLayout()
-        btn_layout_settings.addStretch()
-        btn_layout_settings.addWidget(save_settings_btn)
-        settings_main_layout.addLayout(btn_layout_settings)
+        # 「설정 저장」 버튼은 창 맨 아래 Quit 줄에 있다 (Settings 탭에서만 보임)
 
         def section(title):
             """제목이 있는 테두리 칸 — QGroupBox 는 굵은 글꼴이 안쪽 위젯까지 번져 쓰지 않는다."""
@@ -1275,17 +1279,21 @@ class MainWin(qtw.QWidget):
         settings_layout.addRow("Target Path (Review):", target_box)
 
         path_box.addLayout(settings_layout)
-        settings_main_layout.addWidget(path_frame)
 
-        # 3-2. 일정 등록 — 위임 메일 담당자
+        # 3-2. 일정 등록 — 위임 메일 담당자 (파일 경로 칸 오른쪽)
         cal_frame, cal_box = section("일정 등록")
-        cal_form = qtw.QFormLayout()
+        cal_box.addWidget(qtw.QLabel("위임 메일 담당자"))
         self.assignees_edit = qtw.QLineEdit(", ".join(calendar_assignees()))
         self.assignees_edit.setPlaceholderText("이여름, 한송희")
-        cal_form.addRow("위임 메일 담당자:", self.assignees_edit)
-        cal_box.addLayout(cal_form)
+        cal_box.addWidget(self.assignees_edit)
         cal_box.addWidget(hint("쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다."))
-        settings_main_layout.addWidget(cal_frame)
+        cal_box.addStretch()
+
+        top_row = qtw.QHBoxLayout()
+        top_row.setSpacing(12)
+        top_row.addWidget(path_frame, 3)
+        top_row.addWidget(cal_frame, 2)
+        settings_main_layout.addLayout(top_row)
 
         # 3-3. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
         abbr_frame, abbr_box = section("출원인 약칭")
@@ -1307,9 +1315,11 @@ class MainWin(qtw.QWidget):
         self.abbr_table.setObjectName("abbrTable")
         self.abbr_table.setHorizontalHeaderLabels(["출원인 국문 명칭", "약칭"])
         header = self.abbr_table.horizontalHeader()
+        use_app_font(self.abbr_table, header)
+        self.abbr_table.setWordWrap(False)  # 긴 이름은 두 줄로 접지 않고 「…」 로 줄인다
         header.setSectionResizeMode(0, qtw.QHeaderView.Stretch)
         header.setSectionResizeMode(1, qtw.QHeaderView.Interactive)
-        header.resizeSection(1, 200)
+        header.resizeSection(1, 200)  # 창 크기에 맞춰 _fit_abbr_column 이 다시 맞춘다
         header.setHighlightSections(False)
         header.setDefaultAlignment(qtc.Qt.AlignLeft | qtc.Qt.AlignVCenter)
         self.abbr_table.verticalHeader().setVisible(False)
@@ -1374,17 +1384,32 @@ class MainWin(qtw.QWidget):
 
         quit_row = qtw.QHBoxLayout()
         quit_row.setContentsMargins(18, 8, 18, 14)
+        quit_row.setSpacing(8)
+        # Settings 탭에서만: 안내 + 「설정 저장」 (Quit 과 같은 크기)
+        self.save_hint = qtw.QLabel("변경 사항은 저장해야 적용됩니다")
+        self.save_hint.setObjectName("settingsHint")
+        self.save_btn = qtw.QPushButton("설정 저장")
+        self.save_btn.setObjectName("saveButton")
+        self.save_btn.clicked.connect(self.save_settings_ui)
         quit_btn = qtw.QPushButton("Quit")
         quit_btn.setObjectName("quitButton")
         quit_btn.clicked.connect(self.quit_clicked)
+        quit_row.addSpacing(self.sidebar.width())
+        quit_row.addWidget(self.save_hint)
         quit_row.addStretch()
+        quit_row.addWidget(self.save_btn)
         quit_row.addWidget(quit_btn)
         win_layout.addLayout(quit_row)
+        self.bottom_buttons = (self.save_btn, quit_btn)
+
+        self.stack.currentChanged.connect(self._on_page_changed)
+        self._on_page_changed(self.stack.currentIndex())
 
         self.setLayout(win_layout)
         self.setWindowTitle("Task Manager")
         self.setWindowIcon(qtg.QIcon(resource_path("icon.png")))
-        self.resize(560, 460)
+        self.setMinimumSize(760, 560)
+        self.resize(900, 640)
 
         # UI 개선 #2: 하드코딩된 move(300,300) 대신 화면 중앙에 배치
         screen_geometry = qtw.QApplication.primaryScreen().availableGeometry()
@@ -1445,7 +1470,7 @@ class MainWin(qtw.QWidget):
         self.abbr_table.insertRow(row)
         self.abbr_table.setItem(row, 0, qtw.QTableWidgetItem(name))
         abbr_item = qtw.QTableWidgetItem(abbr)
-        font = abbr_item.font()
+        font = qtg.QFont(self.abbr_table.font())  # 힌팅 끔이 든 표 글꼴을 굵게
         font.setBold(True)
         abbr_item.setFont(font)
         self.abbr_table.setItem(row, 1, abbr_item)
@@ -1567,6 +1592,39 @@ class MainWin(qtw.QWidget):
         if any(keyword in status for keyword in ("Existing", "완료", "Downloaded")):
             return "#E1EEE7", "#1B4B43"
         return "#F2F2F0", "#5F5E5A"
+
+    def _on_page_changed(self, index):
+        """「설정 저장」 과 안내는 Settings 탭에서만 보인다."""
+        on_settings = self.stack.widget(index) is self.tab_settings
+        self.save_hint.setVisible(on_settings)
+        self.save_btn.setVisible(on_settings)
+        if on_settings:
+            self._fit_abbr_column()
+
+    def _equalize_bottom_buttons(self):
+        """「설정 저장」 과 Quit 을 같은 폭·높이로 — 둘 중 큰 쪽에 맞춘다."""
+        for btn in self.bottom_buttons:
+            btn.ensurePolished()
+        width = max([110] + [b.sizeHint().width() for b in self.bottom_buttons])
+        height = max([36] + [b.sizeHint().height() for b in self.bottom_buttons])
+        for btn in self.bottom_buttons:
+            btn.setFixedSize(width, height)
+
+    def _fit_abbr_column(self):
+        """약칭 열은 표 너비의 28% (최소 160px) — 이름 열이 나머지를 쓴다."""
+        width = self.abbr_table.viewport().width()
+        if width > 0:
+            self.abbr_table.horizontalHeader().resizeSection(1, max(160, int(width * 0.28)))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        use_app_font(self.abbr_table.horizontalHeader())  # 스타일시트 적용 뒤에 다시 — 헤더는 이때 기본 글꼴로 돌아간다
+        self._equalize_bottom_buttons()
+        self._fit_abbr_column()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_abbr_column()
 
     def closeEvent(self, event):
         event.ignore()
@@ -1847,6 +1905,20 @@ if __name__ == "__main__":
         }
         #quitButton:pressed {
             background-color: #F5C4B3;
+        }
+        QPushButton#saveButton {
+            background-color: #185FA5;
+            color: white;
+            border: 1px solid #185FA5;
+            border-radius: 10px;
+        }
+        QPushButton#saveButton:hover {
+            background-color: #0C447C;
+            border-color: #0C447C;
+        }
+        QPushButton#saveButton:pressed {
+            background-color: #042C53;
+            border-color: #042C53;
         }
     """)
 
