@@ -593,6 +593,11 @@ class TestNaverCal(unittest.TestCase):
         self.assertEqual(a, naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 8)))
         self.assertNotEqual(a, naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 9)))
 
+    def test_event_url_uses_full_uid(self):
+        """네이버는 일정을 UID 전체(@ 포함)로 저장한다 — 실제 서버에서 확인."""
+        url = naver_cal.event_url_for("https://caldav.calendar.naver.com/caldav/me/calendar/1/", "abc@tmproject")
+        self.assertEqual(url, "https://caldav.calendar.naver.com/caldav/me/calendar/1/abc%40tmproject.ics")
+
     def test_all_day_ics(self):
         ics = naver_cal.build_ics("u@tmproject", "PA-2T8084_의견서", date(2027, 12, 31), "a;b,c\\d\r\n줄",
                                   now=datetime(2026, 10, 15, 3, 0, 0))

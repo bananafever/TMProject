@@ -72,6 +72,11 @@ def make_uid(calendar_name: str, subject: str, day: date) -> str:
     return f"{digest}@tmproject"
 
 
+def event_url_for(calendar_url: str, uid: str) -> str:
+    """네이버는 PUT 한 경로와 상관없이 일정을 `{UID 전체}.ics` 로 저장한다 — 같은 경로를 써야 다시 찾을 수 있다."""
+    return calendar_url + urllib.parse.quote(uid, safe="") + ".ics"
+
+
 def _escape(text: str) -> str:
     return (text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
             .replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n"))
@@ -233,7 +238,7 @@ class Session:
         if not url:
             raise NaverError(f"네이버 캘린더 「{calendar_name}」 가 없습니다.")
         uid = make_uid(calendar_name, subject, day)
-        event_url = url + urllib.parse.quote(uid.split("@")[0]) + ".ics"
+        event_url = event_url_for(url, uid)
         status, _final, _text = self._request("GET", event_url)
         if status != 404:
             return False
