@@ -160,6 +160,7 @@ keywords/
 CLAUDE.md
 settings.json
 case_cache.json
+calendar_state.json
 
 # OS files
 .DS_Store

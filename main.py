@@ -56,6 +56,8 @@ DEFAULT_CONFIG = {
     "naver_calendars": {"Mail": "Mail", "No_Instructions": "No_Instructions"},
     # 일정 제목 끝에 붙일 출원인 약칭 (예고 메일의 국문 명칭 → 약칭). 없으면 자동으로 줄인다.
     "applicant_abbr": {},
+    # 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록한다
+    "calendar_assignees": ["이여름", "한송희"],
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -936,7 +938,21 @@ class ScheduleDialog(qtw.QDialog):
         self.btn_close.setVisible(True)
 
 
-CALENDAR_ASSIGNEES = ["이여름", "한송희"]  # 이 담당자 앞으로 온 위임 메일만 일정 등록
+def parse_names(text):
+    """「이여름, 한송희」 → ["이여름", "한송희"] (공백 정리, 빈 이름·중복 제거)."""
+    return list(dict.fromkeys(n for n in (squash(t) for t in (text or "").split(",")) if n))
+
+
+def calendar_assignees():
+    """이 담당자 앞으로 온 위임 메일만 일정을 등록한다 (Settings 「위임 메일 담당자」)."""
+    return config.get("calendar_assignees") or DEFAULT_CONFIG["calendar_assignees"]
+
+
+def recent_applicants(cache, existing=()):
+    """사건 캐시에 저장된 출원인 가운데 existing 에 없는 이름 (가나다순)."""
+    have = {squash(n) for n in existing}
+    names = {squash(v.get("applicant")) for v in cache.values()} - have - {""}
+    return sorted(names)
 
 
 def is_calendar_delegation(message):
@@ -944,7 +960,7 @@ def is_calendar_delegation(message):
     if "위임" not in message.Subject:
         return False
     names = name_key.findall(message.Subject)
-    if not names or names[0][2:] not in CALENDAR_ASSIGNEES:
+    if not names or names[0][2:] not in calendar_assignees():
         return False
     return sender_matches(message, CALENDAR_SENDERS)
 
@@ -1192,6 +1208,26 @@ class MainWin(qtw.QWidget):
         btn_layout_settings.addWidget(save_settings_btn)
         settings_main_layout.addLayout(btn_layout_settings)
 
+        def section(title):
+            """제목이 있는 테두리 칸 — QGroupBox 는 굵은 글꼴이 안쪽 위젯까지 번져 쓰지 않는다."""
+            frame = qtw.QFrame()
+            frame.setObjectName("settingsSection")
+            box = qtw.QVBoxLayout(frame)
+            box.setContentsMargins(14, 12, 14, 12)
+            box.setSpacing(8)
+            label = qtw.QLabel(title)
+            label.setObjectName("sectionTitle")
+            box.addWidget(label)
+            return frame, box
+
+        def hint(text):
+            label = qtw.QLabel(text)
+            label.setObjectName("settingsHint")
+            label.setWordWrap(True)
+            return label
+
+        # 3-1. 파일 경로
+        path_frame, path_box = section("파일 경로")
         settings_layout = qtw.QFormLayout()
 
         self.parent_path_edit = qtw.QLineEdit(config["parent_path"])
@@ -1211,36 +1247,58 @@ class MainWin(qtw.QWidget):
         settings_layout.addRow("Parent Path (Tasks):", parent_box)
         settings_layout.addRow("Target Path (Review):", target_box)
 
-        settings_main_layout.addLayout(settings_layout)
+        path_box.addLayout(settings_layout)
+        settings_main_layout.addWidget(path_frame)
 
-        # 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
-        abbr_header = qtw.QHBoxLayout()
-        abbr_header.addWidget(qtw.QLabel("출원인 약칭"))
-        abbr_header.addStretch()
-        abbr_hint = qtw.QLabel(f"표에 없으면 자동: 법인 표기·공백 제거 후 앞 {ABBR_LEN}자")
-        abbr_hint.setStyleSheet("color: gray;")
-        abbr_header.addWidget(abbr_hint)
-        settings_main_layout.addLayout(abbr_header)
+        # 3-2. 일정 등록 — 위임 메일 담당자
+        cal_frame, cal_box = section("일정 등록")
+        cal_form = qtw.QFormLayout()
+        self.assignees_edit = qtw.QLineEdit(", ".join(calendar_assignees()))
+        self.assignees_edit.setPlaceholderText("이여름, 한송희")
+        cal_form.addRow("위임 메일 담당자:", self.assignees_edit)
+        cal_box.addLayout(cal_form)
+        cal_box.addWidget(hint("쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다."))
+        settings_main_layout.addWidget(cal_frame)
+
+        # 3-3. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
+        abbr_frame, abbr_box = section("출원인 약칭")
+        toolbar = qtw.QHBoxLayout()
+        self.abbr_search = qtw.QLineEdit()
+        self.abbr_search.setPlaceholderText("검색 (명칭·약칭)")
+        self.abbr_search.setClearButtonEnabled(True)
+        self.abbr_search.textChanged.connect(self.filter_abbr_rows)
+        toolbar.addWidget(self.abbr_search, 1)
+        for text, slot in (("최근 출원인 가져오기", self.import_applicants_clicked),
+                           ("추가", self.add_abbr_clicked), ("삭제", self.delete_abbr_clicked)):
+            btn = qtw.QPushButton(text)
+            btn.setObjectName("secondaryButton")
+            btn.clicked.connect(slot)
+            toolbar.addWidget(btn)
+        abbr_box.addLayout(toolbar)
 
         self.abbr_table = qtw.QTableWidget(0, 2)
+        self.abbr_table.setObjectName("abbrTable")
         self.abbr_table.setHorizontalHeaderLabels(["출원인 국문 명칭", "약칭"])
-        self.abbr_table.horizontalHeader().setSectionResizeMode(0, qtw.QHeaderView.Stretch)
-        self.abbr_table.horizontalHeader().setSectionResizeMode(1, qtw.QHeaderView.ResizeToContents)
+        header = self.abbr_table.horizontalHeader()
+        header.setSectionResizeMode(0, qtw.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, qtw.QHeaderView.Interactive)
+        header.resizeSection(1, 200)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(qtc.Qt.AlignLeft | qtc.Qt.AlignVCenter)
         self.abbr_table.verticalHeader().setVisible(False)
+        self.abbr_table.verticalHeader().setDefaultSectionSize(32)
+        self.abbr_table.setShowGrid(False)
+        self.abbr_table.setAlternatingRowColors(True)
         self.abbr_table.setSelectionBehavior(qtw.QAbstractItemView.SelectRows)
-        for name, abbr in (config.get("applicant_abbr") or {}).items():
+        self.abbr_table.setEditTriggers(qtw.QAbstractItemView.DoubleClicked | qtw.QAbstractItemView.EditKeyPressed
+                                        | qtw.QAbstractItemView.AnyKeyPressed)
+        for name, abbr in sorted((config.get("applicant_abbr") or {}).items()):
             self._add_abbr_row(name, abbr)
-        settings_main_layout.addWidget(self.abbr_table, 1)
-
-        abbr_add_btn = qtw.QPushButton("추가")
-        abbr_add_btn.clicked.connect(self.add_abbr_clicked)
-        abbr_del_btn = qtw.QPushButton("삭제")
-        abbr_del_btn.clicked.connect(self.delete_abbr_clicked)
-        abbr_btns = qtw.QHBoxLayout()
-        abbr_btns.addWidget(abbr_add_btn)
-        abbr_btns.addWidget(abbr_del_btn)
-        abbr_btns.addStretch()
-        settings_main_layout.addLayout(abbr_btns)
+        abbr_box.addWidget(self.abbr_table, 1)
+        abbr_box.addWidget(hint(
+            f"표에 없거나 약칭을 비운 출원인은 자동 약칭(법인 표기·공백 제거 후 앞 {ABBR_LEN}자)을 씁니다. "
+            "약칭을 비운 행은 저장하지 않습니다. 셀을 더블클릭해 고칩니다."))
+        settings_main_layout.addWidget(abbr_frame, 1)
 
         # 좌측 아이콘 사이드바 + 우측 콘텐츠 스택
         self.stack = qtw.QStackedWidget()
@@ -1359,10 +1417,15 @@ class MainWin(qtw.QWidget):
         row = self.abbr_table.rowCount()
         self.abbr_table.insertRow(row)
         self.abbr_table.setItem(row, 0, qtw.QTableWidgetItem(name))
-        self.abbr_table.setItem(row, 1, qtw.QTableWidgetItem(abbr))
+        abbr_item = qtw.QTableWidgetItem(abbr)
+        font = abbr_item.font()
+        font.setBold(True)
+        abbr_item.setFont(font)
+        self.abbr_table.setItem(row, 1, abbr_item)
         return row
 
     def add_abbr_clicked(self):
+        self.abbr_search.clear()  # 새 행이 검색에 가려지지 않게
         row = self._add_abbr_row()
         self.abbr_table.setCurrentCell(row, 0)
         self.abbr_table.editItem(self.abbr_table.item(row, 0))
@@ -1371,15 +1434,47 @@ class MainWin(qtw.QWidget):
         for row in sorted({i.row() for i in self.abbr_table.selectedIndexes()}, reverse=True):
             self.abbr_table.removeRow(row)
 
+    def _abbr_cell(self, row, col):
+        item = self.abbr_table.item(row, col)
+        return item.text() if item else ""
+
+    def filter_abbr_rows(self, text):
+        needle = squash(text).lower()
+        for row in range(self.abbr_table.rowCount()):
+            hay = f"{self._abbr_cell(row, 0)} {self._abbr_cell(row, 1)}".lower()
+            self.abbr_table.setRowHidden(row, bool(needle) and needle not in hay)
+
+    def import_applicants_clicked(self):
+        """예고 메일 때 저장한 출원인 가운데 표에 없는 이름을 약칭이 빈 행으로 더한다."""
+        existing = [self._abbr_cell(r, 0) for r in range(self.abbr_table.rowCount())]
+        names = recent_applicants(load_case_cache(), existing)
+        if not names:
+            qtw.QMessageBox.information(self, "출원인 약칭", "새로 가져올 출원인이 없습니다.")
+            return
+        self.abbr_search.clear()
+        for name in names:
+            row = self._add_abbr_row(name, "")
+            self.abbr_table.item(row, 0).setToolTip("최근 예고 메일에서 가져옴")
+        first = self.abbr_table.rowCount() - len(names)
+        self.abbr_table.scrollToItem(self.abbr_table.item(first, 0))
+        self.abbr_table.setCurrentCell(first, 1)
+
     def save_settings_ui(self):
         config["parent_path"] = self.parent_path_edit.text()
         config["target_path"] = self.target_path_edit.text()
-        cell = lambda r, c: self.abbr_table.item(r, c).text() if self.abbr_table.item(r, c) else ""
+        config["calendar_assignees"] = parse_names(self.assignees_edit.text()) or DEFAULT_CONFIG["calendar_assignees"]
+        self.assignees_edit.setText(", ".join(config["calendar_assignees"]))
         config["applicant_abbr"] = abbr_table_from_rows(
-            (cell(r, 0), cell(r, 1)) for r in range(self.abbr_table.rowCount())
+            (self._abbr_cell(r, 0), self._abbr_cell(r, 1)) for r in range(self.abbr_table.rowCount())
         )
+        # 저장한 그대로 다시 채운다 — 약칭을 비운 행은 빠지고 이름순으로 정리된다
+        self.abbr_table.setRowCount(0)
+        for name, abbr in sorted(config["applicant_abbr"].items()):
+            self._add_abbr_row(name, abbr)
+        self.filter_abbr_rows(self.abbr_search.text())
         save_config()
-        logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}")
+        logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
+                     f"담당자: {config['calendar_assignees']}, 약칭 {len(config['applicant_abbr'])}개")
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")
 
     def add_table_row(self, dt, ref, name, status):
@@ -1662,6 +1757,52 @@ if __name__ == "__main__":
             subcontrol-position: top left;
             padding: 0 3px;
             left: 10px;
+        }
+        #settingsSection {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 10px;
+        }
+        #settingsSection QLabel {
+            background-color: transparent;
+        }
+        #sectionTitle {
+            font-weight: bold;
+            font-size: 11pt;
+        }
+        #settingsHint {
+            color: #8A877E;
+            font-size: 9pt;
+        }
+        QPushButton#secondaryButton {
+            background-color: white;
+            color: #26695E;
+            border: 1px solid #9FC9BF;
+            border-radius: 8px;
+            padding: 5px 12px;
+            font-weight: normal;
+        }
+        QPushButton#secondaryButton:hover {
+            background-color: #E1F5EE;
+        }
+        QTableWidget#abbrTable {
+            background-color: white;
+            alternate-background-color: #F6F6F4;
+            border: 1px solid #DCE3DF;
+            border-radius: 8px;
+            selection-background-color: #E1F5EE;
+            selection-color: #085041;
+        }
+        QTableWidget#abbrTable::item {
+            padding: 0 8px;
+        }
+        QTableWidget#abbrTable QHeaderView::section {
+            background-color: #F1EFE8;
+            color: #5F5E5A;
+            border: none;
+            border-bottom: 1px solid #D3D1C7;
+            padding: 6px 8px;
+            font-weight: bold;
         }
         QScrollArea, #cardsContainer {
             background-color: transparent;

@@ -622,6 +622,26 @@ class TestApplicant(unittest.TestCase):
         self.assertEqual(main.with_applicant("PA-2T8084_의견서", ""), "PA-2T8084_의견서")
         self.assertEqual(main.with_applicant("PA-2T8084_의견서", None), "PA-2T8084_의견서")
 
+    def test_parse_names(self):
+        self.assertEqual(main.parse_names(" 이여름 ,한송희,, 이여름 "), ["이여름", "한송희"])
+        self.assertEqual(main.parse_names(""), [])
+
+    def test_calendar_assignees_from_config(self):
+        with patch.dict(main.config, {"calendar_assignees": ["신용석"]}):
+            self.assertEqual(main.calendar_assignees(), ["신용석"])
+            message = make_mock_message("[위임] PA-2T8084; 한송희(팀); OA [서 2026-10-01]; 001")
+            with patch.object(main, "sender_matches", return_value=True):
+                self.assertFalse(main.is_calendar_delegation(message))
+                message.Subject = "[위임] PA-2T8084; 신용석(팀); OA [서 2026-10-01]; 001"
+                self.assertTrue(main.is_calendar_delegation(message))
+        with patch.dict(main.config, {"calendar_assignees": []}):
+            self.assertEqual(main.calendar_assignees(), ["이여름", "한송희"])
+
+    def test_recent_applicants(self):
+        cache = {"a": {"applicant": "아우디  아게"}, "b": {"applicant": "도쿄엘렉트론가부시키가이샤"},
+                 "c": {"applicant": ""}, "d": {}}
+        self.assertEqual(main.recent_applicants(cache, ["아우디 아게"]), ["도쿄엘렉트론가부시키가이샤"])
+
     def test_abbr_table_from_rows(self):
         rows = [(" 도쿄엘렉트론가부시키가이샤 ", "TEL"), ("빈 약칭", ""), ("", "X"),
                 ("아우디  아게", "AUDI"), ("아우디 아게", "아우디")]
