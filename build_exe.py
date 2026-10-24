@@ -18,6 +18,8 @@ def build_exe():
     # 숨겨진 임포트 (발견되지 않는 모듈 강제 포함)
     hidden_imports = [
         "win32timezone", # Outlook 연동시 필요할 수 있음
+        "pymysql",       # NAS iplog (db.py 가 함수 안에서 들인다)
+        "pymysql.cursors",
     ]
 
     # 2. PyInstaller 인자 구성
