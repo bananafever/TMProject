@@ -33,6 +33,7 @@ from PySide6 import QtSvg as qts
 
 import db
 import deadline_watch
+import instruction_mail
 import kipris
 import naver_cal
 
@@ -91,6 +92,8 @@ DEFAULT_CONFIG = {
     # 기한 확인 (NAS iplog 차수) — 알림을 넣을 네이버 캘린더 이름, 확인 시각 (warn 기한일 경고 · ext 연장 확인)
     "alert_calendar": "알림",
     "deadline_times": dict(deadline_watch.DEFAULT_TIMES),
+    # 받은 지시 — 고객 메일을 전달(FW:)하는 대표 메일함의 보낸 사람 이름. 받은편지함의 이 메일을 NAS instructions 에 적는다
+    "instruction_senders": list(instruction_mail.DEFAULT_SENDERS),
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -523,6 +526,59 @@ def handle_prenotice(message):
 
 def is_prenotice(message):
     return PRENOTICE_SUBJECT in message.Subject and sender_matches(message, PRENOTICE_SENDERS)
+
+
+# ── 받은 지시(고객 지시 메일) → .msg + NAS `instructions` (CPProject docs/INSTRUCTION_MAIL_PLAN.md 6절) ──────────
+INSTRUCTION_SCAN_DAYS = 14
+
+
+def instruction_senders():
+    return config.get("instruction_senders") or list(instruction_mail.DEFAULT_SENDERS)
+
+
+def in_inbox(message, outlook) -> bool:
+    """처리하는 지금 받은편지함에 있는가 — 받은편지함만 본다(사용자 10-24)."""
+    try:
+        return message.Parent.EntryID == outlook.GetDefaultFolder(6).EntryID
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def instruction_ref(message, outlook) -> str:
+    """받은 지시면 Ref, 아니면 "". 값싼 제목 검사 → 받은편지함 → 보낸 사람(Restrict 필터) → 본문 첫머리 차례."""
+    subject = message.Subject or ""
+    if instruction_mail.SKIP_SUBJECT.search(subject):
+        return ""
+    if not in_inbox(message, outlook) or not sender_matches(message, instruction_senders()):
+        return ""
+    return instruction_mail.choose(subject, message.Body or "")
+
+
+def record_instruction(message, ref, session, tray=None):
+    """고른 메일 하나 — 저장·적기. 연장 낱말이면 트레이에 「기연 지시일 수 있음」(tray 가 있을 때)."""
+    got = instruction_mail.handle(message, ref, DATA_DIR, instruction_senders()[0], session=session)
+    if got and got["alert"] and tray is not None:
+        tray.showMessage("기연 지시일 수 있음 — %s" % (ref or "Ref 모름"), message.Subject or "",
+                         qtw.QSystemTrayIcon.MessageIcon.Information, 20000)
+    return got
+
+
+def scan_instructions(outlook, days=INSTRUCTION_SCAN_DAYS):
+    """켤 때 — 받은편지함 최근 days 일의 받은 지시(꺼져 있던 동안 이미 다른 폴더로 옮긴 메일은 못 본다)."""
+    inbox = outlook.GetDefaultFolder(6)
+    since = date.today() - timedelta(days=days)
+    found = 0
+    for message in list(inbox.Items.Restrict(build_sender_filter(instruction_senders()))):
+        try:
+            if instruction_mail.received_of(message).date() < since:
+                continue
+            ref = instruction_mail.choose(message.Subject or "", message.Body or "")
+            if ref and record_instruction(message, ref, outlook) is not None:
+                found += 1
+        except Exception as e:                          # noqa: BLE001
+            logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
+    if found:
+        logging.info(f"받은 지시 따라잡기: {found}통")
 
 
 def scan_prenotices(outlook, days=PRENOTICE_SCAN_DAYS):
@@ -1309,6 +1365,15 @@ class Handler_Class:
                 except Exception as e:
                     logging.error(f"위임 메일 일정 등록 실패: {message.Subject} — {e}", exc_info=True)
 
+            # 받은 지시(고객 지시 메일) — 받은편지함의 대표 메일함 전달분만 .msg 로 두고 NAS 에 적는다
+            try:
+                ref = instruction_ref(message, Handler_Class.outlook.Session)
+                if ref:
+                    tray = getattr(Handler_Class.main_win, "tray_icon", None)
+                    record_instruction(message, ref, Handler_Class.outlook.Session, tray)
+            except Exception as e:
+                logging.error(f"받은 지시 처리 실패: {message.Subject} — {e}", exc_info=True)
+
 
 class MainWin(qtw.QWidget):
 
@@ -1940,6 +2005,10 @@ if __name__ == "__main__":
         scan_prenotices(outlook_mapi)
     except Exception as e:
         logging.error(f"예고 메일 스캔 실패: {e}", exc_info=True)
+    try:
+        scan_instructions(outlook_mapi)
+    except Exception as e:
+        logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
     app = qtw.QApplication(sys.argv)
     setup_app_fonts(app)
 

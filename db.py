@@ -1,4 +1,5 @@
-"""NAS MariaDB `iplog` — 받은 위임(`assignments`)을 쓰고, 차수(`projects`)를 읽고 고친다. Qt·Outlook 을 모른다.
+"""NAS MariaDB `iplog` — 받은 위임(`assignments`)·받은 지시(`instructions`)를 쓰고, 차수(`projects`)를 읽고 고친다.
+Qt·Outlook 을 모른다.
 
 - 접속 정보: ChekPat 의 %APPDATA%\\ChekPat\\credentials.dat (DPAPI 봉인 JSON — `DB_HOST`·`DB_PORT`(비면 3307)·
   `DB_USERNAME`·`DB_PASSWORD`). kipris.py 가 KIPRIS 키를 읽는 것과 같은 엔트로피로 연다. DB 이름은 `iplog`.
@@ -12,8 +13,9 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import kipris
 
@@ -96,21 +98,43 @@ def test_connection() -> str:
     return f"연결됨 — {DB_NAME} · 받은 위임 {int(row.get('n') or 0)}줄 (등록 대기 {int(row.get('waiting') or 0)})"
 
 
-# ── 받은 위임 쓰기 ────────────────────────────────────────────────────
+# ── 받은 위임·받은 지시 쓰기 ──────────────────────────────────────────
 
-def insert_assignments(conn, rows: List[dict]) -> int:
+@dataclass(frozen=True)
+class Table:
+    """`INSERT IGNORE` 로 쓰는 표 — 이름·칸·기록에 쓸 이름·한 줄 설명."""
+    name: str
+    columns: Tuple[str, ...]
+    label: str
+    describe: Callable[[dict], str]
+
+
+ASSIGNMENTS = Table("assignments", ASSIGNMENT_COLUMNS, "받은 위임",
+                    lambda r: f"{r.get('ref')} {r.get('doc_type') or ''} (보고 {r.get('report_due') or '-'})")
+# 받은 지시(CPProject docs/INSTRUCTION_MAIL_PLAN.md 6절) — 원 발신인·고객 날짜는 ChekPat 이 본문에서 푼다
+INSTRUCTION_COLUMNS = ("mail_entry_id", "message_id", "received_at", "from_name", "subject", "ref_hint",
+                       "attachments", "body_text", "orig_text", "orig_head", "msg_path", "source")
+INSTRUCTIONS = Table("instructions", INSTRUCTION_COLUMNS, "받은 지시",
+                     lambda r: f"{r.get('ref_hint') or '-'} {(r.get('subject') or '')[:80]}")
+
+
+def insert_rows(conn, rows: List[dict], table: Table = ASSIGNMENTS) -> int:
     """`INSERT IGNORE` 로 쓴다(같은 mail_entry_id 는 건너뜀). 커밋까지. 반환값: 새로 들어간 줄 수."""
     if not rows:
         return 0
-    cols = ", ".join(ASSIGNMENT_COLUMNS)
-    marks = ", ".join(["%s"] * len(ASSIGNMENT_COLUMNS))
+    cols = ", ".join(table.columns)
+    marks = ", ".join(["%s"] * len(table.columns))
     added = 0
     with conn.cursor() as cur:
         for row in rows:
-            added += cur.execute(f"INSERT IGNORE INTO assignments ({cols}) VALUES ({marks})",
-                                 tuple(row.get(c) for c in ASSIGNMENT_COLUMNS)) or 0
+            added += cur.execute(f"INSERT IGNORE INTO {table.name} ({cols}) VALUES ({marks})",
+                                 tuple(row.get(c) for c in table.columns)) or 0
     conn.commit()
     return added
+
+
+def insert_assignments(conn, rows: List[dict]) -> int:
+    return insert_rows(conn, rows, ASSIGNMENTS)
 
 
 def load_state(path: str) -> dict:
@@ -121,7 +145,7 @@ def load_state(path: str) -> dict:
     except FileNotFoundError:
         data = {}
     except Exception as e:
-        logging.error(f"받은 위임 기록 로드 실패: {e}")
+        logging.error(f"NAS 기록 상태 로드 실패({os.path.basename(path)}): {e}")
         data = {}
     data = data if isinstance(data, dict) else {}
     return {"recorded": dict(data.get("recorded") or {}), "pending": list(data.get("pending") or [])}
@@ -137,7 +161,7 @@ def save_state(path: str, state: dict, today: Optional[date] = None) -> None:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception as e:
-        logging.error(f"받은 위임 기록 저장 실패: {e}")
+        logging.error(f"NAS 기록 상태 저장 실패({os.path.basename(path)}): {e}")
 
 
 def is_recorded(path: str, entry_id: str) -> bool:
@@ -145,8 +169,9 @@ def is_recorded(path: str, entry_id: str) -> bool:
     return entry_id in state["recorded"] or any(p.get("mail_entry_id") == entry_id for p in state["pending"])
 
 
-def record(rows: List[dict], path: str, connect_fn=None, today: Optional[date] = None) -> dict:
-    """받은 위임 줄을 NAS 에 쓴다 — 쌓여 있던 pending 도 함께. 예외를 내지 않는다.
+def record(rows: List[dict], path: str, connect_fn=None, today: Optional[date] = None,
+           table: Table = ASSIGNMENTS) -> dict:
+    """받은 위임(또는 table 의) 줄을 NAS 에 쓴다 — 쌓여 있던 pending 도 함께. 예외를 내지 않는다.
 
     반환값: {"written": 새로 들어간 줄, "pending": 아직 못 쓴 줄 수, "error": 실패 사유 또는 ""}
     """
@@ -161,7 +186,7 @@ def record(rows: List[dict], path: str, connect_fn=None, today: Optional[date] =
     try:
         conn = (connect_fn or connect)()
         try:
-            written = insert_assignments(conn, list(todo.values()))
+            written = insert_rows(conn, list(todo.values()), table)
         finally:
             conn.close()
     except Exception as e:
@@ -169,13 +194,13 @@ def record(rows: List[dict], path: str, connect_fn=None, today: Optional[date] =
     day = (today or date.today()).isoformat()
     if error:
         state["pending"] = list(todo.values())
-        logging.warning(f"받은 위임 NAS 기록 실패 — {len(todo)}줄은 다음에 다시 씁니다: {error}")
+        logging.warning(f"{table.label} NAS 기록 실패 — {len(todo)}줄은 다음에 다시 씁니다: {error}")
     else:
         for entry_id, row in todo.items():
             state["recorded"][entry_id] = day
-            logging.info(f"받은 위임 NAS 기록: {row.get('ref')} {row.get('doc_type') or ''} (보고 {row.get('report_due') or '-'})")
+            logging.info(f"{table.label} NAS 기록: {table.describe(row)}")
         state["pending"] = []
         if written < len(todo):
-            logging.info(f"받은 위임 {len(todo) - written}줄은 이미 NAS 에 있었습니다.")
+            logging.info(f"{table.label} {len(todo) - written}줄은 이미 NAS 에 있었습니다.")
     save_state(path, state, today)
     return {"written": written, "pending": len(state["pending"]), "error": error}
