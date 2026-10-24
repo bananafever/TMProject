@@ -30,7 +30,10 @@ from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
 from PySide6 import QtSvg as qts
 
+import threading
+
 import db
+import deadline_watch
 import kipris
 import naver_cal
 
@@ -86,6 +89,9 @@ DEFAULT_CONFIG = {
     "applicant_abbr": {},
     # 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록한다
     "calendar_assignees": ["이여름", "한송희"],
+    # 기한 확인 (NAS iplog 차수) — 알림을 넣을 네이버 캘린더 이름, 확인 시각 (warn 기한일 경고 · ext 연장 확인)
+    "alert_calendar": "알림",
+    "deadline_times": dict(deadline_watch.DEFAULT_TIMES),
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -1198,6 +1204,74 @@ def catch_up_calendar(outlook):
     return rows
 
 
+# ── 기한 확인 (12:00 기한일 경고 · 17:00 연장 확인) ──────────────────────
+DEADLINE_STATE_FILE = data_path("deadline_state.json")
+
+
+def action_subjects(ref, stage):
+    """차수의 네이버 대응기한 일정 제목 후보 — 출원인 약칭이 붙은 것 먼저 (등록 때와 같은 규칙)."""
+    is_fr = FR_DOC_TYPE in (stage or "")
+    suffixes = (["거결불", "재심사"] if "재심사" in (stage or "") else ["재심사", "거결불"]) if is_fr else ["의견서"]
+    case = find_case(load_case_cache(), ref, FR_DOC_TYPE if is_fr else OA_DOC_TYPE) or {}
+    subjects = [with_applicant(f"{ref}_{suffix}", case.get("applicant", "")) for suffix in suffixes]
+    subjects += [f"{ref}_{suffix}" for suffix in suffixes]
+    return list(dict.fromkeys(subjects))
+
+
+def action_mover():
+    """연장이 확인된 차수의 대응기한 일정(네이버 No_Instructions)을 옮기는 함수 (한 번 도는 동안 접속 하나)."""
+    session = naver_cal.Session()
+    calendar_name = (config.get("naver_calendars") or {}).get("No_Instructions", "")
+
+    def move(row, old_days, new_day):
+        if not calendar_name:
+            raise naver_cal.NaverError("settings.json 의 naver_calendars 에 「No_Instructions」 캘린더 이름이 없습니다.")
+        return deadline_watch.move_action_event(session, calendar_name, action_subjects(row["ref"], row.get("stage")),
+                                                old_days, new_day)
+    return move
+
+
+def deadline_times():
+    return deadline_watch.parse_times(config.get("deadline_times"))
+
+
+class DeadlineRunner(qtc.QObject):
+    """1분마다 확인할 때가 됐는지 보고, 됐으면 스레드에서 NAS·KIPRIS 를 본다. 알림 말풍선은 GUI 스레드에서."""
+
+    alert = qtc.Signal(str, str)
+
+    def __init__(self, tray_icon, parent=None):
+        super().__init__(parent)
+        self.tray_icon = tray_icon
+        self.watcher = deadline_watch.Watcher(DEADLINE_STATE_FILE, lambda: config.get("deadline_times"),
+                                              mover_factory=action_mover)
+        self._busy = threading.Lock()
+        self.alert.connect(self._show)
+        self.timer = qtc.QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(60_000)
+
+    def tick(self):
+        if not self.watcher.pending():
+            return
+        if not self._busy.acquire(blocking=False):
+            return
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            alerts = self.watcher.tick()
+            if alerts:
+                deadline_watch.deliver(alerts, self.alert.emit, naver_cal.Session(), config.get("alert_calendar", ""))
+        except Exception as e:
+            logging.error(f"기한 확인 실패: {e}", exc_info=True)
+        finally:
+            self._busy.release()
+
+    def _show(self, title, text):
+        self.tray_icon.showMessage(title, text, qtw.QSystemTrayIcon.Warning, 20000)
+
+
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
 class Handler_Class:
     # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
@@ -1363,7 +1437,40 @@ class MainWin(qtw.QWidget):
         top_row.addWidget(cal_frame, 2)
         settings_main_layout.addLayout(top_row)
 
-        # 3-3. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
+        # 3-3. 기한 확인 — NAS DB 연결 상태 · 알림 캘린더 · 확인 시각
+        watch_frame, watch_box = section("기한 확인 (NAS iplog)")
+        watch_row = qtw.QHBoxLayout()
+        watch_row.setSpacing(10)
+        self.db_status = qtw.QLabel("연결을 시험하지 않았습니다")
+        self.db_status.setObjectName("settingsHint")
+        db_test_btn = qtw.QPushButton("시험")
+        db_test_btn.setObjectName("secondaryButton")
+        db_test_btn.clicked.connect(self.test_db_clicked)
+        watch_row.addWidget(qtw.QLabel("DB 연결"))
+        watch_row.addWidget(self.db_status, 1)
+        watch_row.addWidget(db_test_btn)
+        watch_box.addLayout(watch_row)
+
+        watch_form = qtw.QHBoxLayout()
+        watch_form.setSpacing(10)
+        watch_form.addWidget(qtw.QLabel("알림 캘린더"))
+        self.alert_calendar_edit = qtw.QLineEdit(config.get("alert_calendar", ""))
+        self.alert_calendar_edit.setPlaceholderText("알림")
+        watch_form.addWidget(self.alert_calendar_edit, 1)
+        times = deadline_times()
+        self.time_edits = {}
+        for kind in deadline_watch.KINDS:
+            watch_form.addWidget(qtw.QLabel(deadline_watch.KIND_NAMES[kind]))
+            edit = qtw.QTimeEdit(qtc.QTime(times[kind].hour, times[kind].minute))
+            edit.setDisplayFormat("HH:mm")
+            self.time_edits[kind] = edit
+            watch_form.addWidget(edit)
+        watch_box.addLayout(watch_form)
+        watch_box.addWidget(hint("기한일 경고: 오늘이 대응기한인데 제출·기연이 없는 차수 · 연장 확인: 그날 기연을 의뢰한 차수를 "
+                                 "KIPRIS 로 확인하고 일정을 옮깁니다. 알림은 트레이 말풍선과 네이버 알림 캘린더(비우면 안 씀)에."))
+        settings_main_layout.addWidget(watch_frame)
+
+        # 3-4. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
         abbr_frame, abbr_box = section("출원인 약칭")
         toolbar = qtw.QHBoxLayout()
         self.abbr_search = qtw.QLineEdit()
@@ -1592,10 +1699,29 @@ class MainWin(qtw.QWidget):
         for name, abbr in sorted(config["applicant_abbr"].items()):
             self._add_abbr_row(name, abbr)
         self.filter_abbr_rows(self.abbr_search.text())
+        config["alert_calendar"] = squash(self.alert_calendar_edit.text())
+        config["deadline_times"] = {kind: edit.time().toString("HH:mm") for kind, edit in self.time_edits.items()}
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
-                     f"담당자: {config['calendar_assignees']}, 약칭 {len(config['applicant_abbr'])}개")
+                     f"담당자: {config['calendar_assignees']}, 약칭 {len(config['applicant_abbr'])}개, "
+                     f"알림 캘린더: {config['alert_calendar'] or '(없음)'}, 확인 시각: {config['deadline_times']}")
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")
+
+    def test_db_clicked(self):
+        qtw.QApplication.setOverrideCursor(qtc.Qt.WaitCursor)
+        try:
+            text, ok = db.test_connection(), True
+            record_assignments([], flush=True)  # 못 쓰고 쌓아 둔 받은 위임이 있으면 지금
+        except db.DbError as e:
+            text, ok = str(e), False
+        finally:
+            qtw.QApplication.restoreOverrideCursor()
+        pending = db.load_state(ASSIGNMENT_STATE_FILE)["pending"]
+        if pending:
+            text += f" · 아직 못 쓴 받은 위임 {len(pending)}줄"
+        self.db_status.setText(text)
+        self.db_status.setStyleSheet("color: #1E6B3A;" if ok else "color: #C0392B;")
+        logging.info(f"NAS DB 연결 시험: {text}")
 
     def add_table_row(self, dt, ref, name, status):
         """메시지 카드를 하나 추가합니다."""
@@ -1995,4 +2121,7 @@ if __name__ == "__main__":
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     # 창을 띄운 뒤: 실패했던 일정 다시 등록 + 꺼져 있던 동안 온 위임 메일 일정 등록 (예고 메일 스캔 다음)
     qtc.QTimer.singleShot(0, lambda: catch_up_calendar(outlook_mapi))
+    # 기한 확인: 1분마다 시각을 보고, 켤 때 놓친 확인은 곧바로 따라잡는다
+    deadline_runner = DeadlineRunner(mw.tray_icon, mw)
+    qtc.QTimer.singleShot(5_000, deadline_runner.tick)
     sys.exit(app.exec())
