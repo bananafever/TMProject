@@ -5,6 +5,7 @@
 - 계정: 환경변수 `NAVER_ID`·`NAVER_APP_PASSWORD` → %APPDATA%\\TMProject\\naver_cred.dat (DPAPI 봉인 JSON).
   `python naver_cal.py --setup` 으로 저장하고, 접속해서 캘린더 이름 목록을 보여 준다.
 - 중복: UID 를 (캘린더·제목·날짜)로 정해 `{캘린더}/{UID}.ics` 에 PUT 한다. 이미 있으면 건너뛴다.
+- 옮기기(기한 연장): 새 날짜로 만들고 옛 날짜의 UID 를 DELETE. 알림: 그 시각에 울리는 VALARM 일정.
 - 표준 라이브러리만 쓴다(kipris.py 와 같이 urllib).
 """
 
@@ -12,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -118,6 +120,52 @@ def build_ics(uid: str, subject: str, day: date, body: str, now: Optional[dateti
         "END:VCALENDAR",
     ]
     return "\r\n".join(_fold(line) for line in lines) + "\r\n"
+
+
+def build_alert_ics(uid: str, subject: str, start: datetime, body: str, minutes: int = 10,
+                    now: Optional[datetime] = None) -> str:
+    """알림 일정 하나 — start(시각)에 시작하고 그때 울리는 VALARM. 시각은 UTC 로 적는다."""
+    now = now or datetime.now(timezone.utc)
+    start = start if start.tzinfo else start.astimezone()  # 순진한 시각은 이 PC 의 지역 시각
+    end = start + timedelta(minutes=minutes)
+    if len(body) > MAX_BODY:
+        body = body[:MAX_BODY] + "…"
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//TMProject//TaskManager//KO",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{now.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
+        f"DTSTART:{start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
+        f"DTEND:{end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
+        f"SUMMARY:{_escape(subject)}",
+        *([f"DESCRIPTION:{_escape(body)}"] if body else []),
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        f"DESCRIPTION:{_escape(subject)}",
+        "TRIGGER:PT0S",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ]
+    return "\r\n".join(_fold(line) for line in lines) + "\r\n"
+
+
+def ics_description(ics: str) -> str:
+    """일정 iCalendar 의 (VEVENT) DESCRIPTION 을 풀어 돌려준다. 없으면 ""."""
+    unfolded = re.sub(r"\r?\n[ \t]", "", ics or "")
+    in_alarm = False
+    for line in unfolded.splitlines():
+        if line == "BEGIN:VALARM":
+            in_alarm = True
+        elif line == "END:VALARM":
+            in_alarm = False
+        elif not in_alarm and re.match(r"DESCRIPTION[;:]", line):
+            value = line.split(":", 1)[1] if ":" in line else ""
+            return re.sub(r"\\([\\;,nN])", lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
+    return ""
 
 
 # ── CalDAV ───────────────────────────────────────────────────────────
@@ -255,6 +303,46 @@ class Session:
             return False
         if status == 404:
             raise NaverError(f"네이버 캘린더 「{calendar_name}」 에 일정을 쓰지 못했습니다 (HTTP 404).")
+        return True
+
+    # 옮기기·알림 (기한 확인) ─────────────────────────────
+    def delete_all_day(self, calendar_name: str, subject: str, day: date) -> bool:
+        """이 앱이 (캘린더·제목·날짜)로 등록한 일정을 지운다. 지웠으면 True, 없었으면 False."""
+        status, _final, _text = self._request("DELETE", self._event_url(calendar_name, make_uid(calendar_name, subject, day)))
+        return status != 404
+
+    def move_all_day(self, calendar_name: str, subject: str, old_day: date, new_day: date,
+                     body: Optional[str] = None) -> Tuple[bool, bool]:
+        """일정을 다른 날로 옮긴다 — 새 날짜로 먼저 만들고(실패하면 옛 일정은 그대로) 옛 UID 를 DELETE.
+
+        body=None 이면 옛 일정의 설명칸을 그대로 옮긴다. 반환값: (새 일정을 만들었나, 옛 일정을 지웠나).
+        """
+        if old_day == new_day:
+            return False, False
+        old_url = self._event_url(calendar_name, make_uid(calendar_name, subject, old_day))
+        status, _final, text = self._request("GET", old_url)
+        if body is None:
+            body = ics_description(text) if status != 404 else ""
+        added = self.add_all_day(calendar_name, subject, new_day, body)
+        deleted = False
+        if status != 404:
+            status, _final, _text = self._request("DELETE", old_url)
+            deleted = status != 404
+        return added, deleted
+
+    def add_alert(self, calendar_name: str, subject: str, start: datetime, body: str = "") -> bool:
+        """알림 일정(그 시각에 울림). 같은 캘린더·제목·날짜가 이미 있으면 False."""
+        uid = make_uid(calendar_name, subject, start.date())
+        event_url = self._event_url(calendar_name, uid)
+        status, _final, _text = self._request("GET", event_url)
+        if status != 404:
+            return False
+        status, _final, _text = self._request("PUT", event_url, build_alert_ics(uid, subject, start, body), {
+            "Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"})
+        if status == 412:
+            return False
+        if status == 404:
+            raise NaverError(f"네이버 캘린더 「{calendar_name}」 에 알림을 쓰지 못했습니다 (HTTP 404).")
         return True
 
 
