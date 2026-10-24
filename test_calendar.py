@@ -37,6 +37,21 @@ logging.getLogger().addHandler(logging.NullHandler())
 import tempfile  # noqa: E402
 _TEST_DATA_DIR = tempfile.TemporaryDirectory()
 os.environ["TASKMANAGER_DATA_DIR"] = _TEST_DATA_DIR.name
+# 실제 NAS DB·네이버 캘린더·KIPRIS 에 닿지 않게 — ChekPat credentials.dat(NAS 접속)·kipris_key.dat 와
+# TMProject naver_cred.dat 는 %APPDATA% 아래에서 읽는다. 윈도에서 시험을 돌리면 진짜 접속 정보로 NAS 에
+# 받은 위임 줄(A·B·C)이 실제로 써졌다(2026-10-24). 빈 임시 폴더를 %APPDATA% 로, 접속 환경변수는 지운다.
+_TEST_APPDATA = tempfile.TemporaryDirectory()
+os.environ["APPDATA"] = _TEST_APPDATA.name
+for _key in ("KIPRIS_API_KEY", "NAVER_ID", "NAVER_APP_PASSWORD"):
+    os.environ.pop(_key, None)
+try:  # 그래도 진짜 pymysql 로 붙으려 하면 시험이 실패하게 — 가짜 pymysql 을 끼우는 시험은 그대로 돈다
+    import pymysql as _pymysql
+
+    def _no_real_nas(*_a, **_k):
+        raise OSError("시험 — 실제 NAS DB 에는 붙지 않는다")
+    _pymysql.connect = _no_real_nas
+except ImportError:
+    pass
 
 from dateutil.relativedelta import relativedelta  # noqa: E402
 

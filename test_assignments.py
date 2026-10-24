@@ -108,6 +108,15 @@ class TestRecord(unittest.TestCase):
         with patch.object(db.kipris, "_unprotect", side_effect=OSError):
             self.assertIsNone(db.credentials())
 
+    def test_tests_never_see_real_credentials(self):
+        """시험은 실제 ChekPat 접속 정보를 읽지 않는다 — 윈도에서 시험이 NAS 에 받은 위임을 썼다(2026-10-24)."""
+        self.assertTrue(str(db.kipris._chekpat_dir()).startswith(os.environ["APPDATA"]))
+        self.assertNotIn("TaskManager", os.environ["APPDATA"])
+        self.assertIsNone(db.credentials())
+        import pymysql
+        with self.assertRaises(OSError):
+            pymysql.connect(host="nas")
+
     def test_connect_without_credentials(self):
         with patch.object(db, "credentials", return_value=None):
             with self.assertRaises(db.DbError):
