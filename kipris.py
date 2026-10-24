@@ -9,6 +9,8 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
 - 응답 필드: `Mailingnumber`(발송번호)·`DocNm`(서류명)·`ExpirationDuedateDate`(연장 반영 마감기한).
 - 「특허·실용 서지 상세」(`/kipo-api/kipi/` 게이트, 키는 `ServiceKey`)로 거절결정이 재심사에 의한 것인지 가린다
   — `finalDisposal`(「거절결정(일반)」·「거절결정(재심사)」)과 서류 목록(「…보정서(재심사)」).
+- 같은 서지 상세의 서류 목록(`documentName`·`receiptDate`·`commonCodeName`)으로 기간연장신청서를 냈는지 본다.
+  낸 날 바로 「접수중」 으로 실리고, 마감기한(`ExpirationDuedateDate`)은 「수리」 뒤에야 늘어난다(10-24 확인).
 """
 
 import json
@@ -46,6 +48,14 @@ class Notice:
     send_number: str                 # 발송번호
     title: str                       # 서류명 — 「의견제출통지서」·「최후의견제출통지서」 …
     due_date: str                    # 마감기한 YYYY-MM-DD — 연장했으면 연장 뒤 기한
+
+
+@dataclass
+class Document:
+    name: str                        # 서류명 — 「[지정기간연장]기간 연장신청서·기간 단축신청서·…」
+    receipt_date: str                # 접수일자 YYYY-MM-DD
+    status: str                      # 처리 상태 — 「접수중」·「수리」·「발송처리완료」 …
+    number: str                      # 접수번호
 
 
 # ── 키 ───────────────────────────────────────────────────────────────
@@ -217,6 +227,18 @@ def parse_reexam(xml_text) -> bool:
     return any("보정서(재심사)" in _text(el) for el in root.iter() if _local(el.tag).lower() == "documentname")
 
 
+def parse_documents(xml_text) -> List[Document]:
+    """서지 상세 응답 XML → 서류 목록 (접수 순). 처리 상태의 영문 괄호는 뗀다 — 「접수중 (On receiving)」 → 「접수중」."""
+    out = []
+    for r in records(_find(parse_root(xml_text, "특허·실용 서지 상세"), "body")):
+        name = field(r, "documentName")
+        if name:
+            out.append(Document(name=name, receipt_date=iso_date(field(r, "receiptDate")),
+                                status=re.sub(r"\s*\(.*\)\s*$", "", field(r, "commonCodeName")),
+                                number=field(r, "receiptNumber")))
+    return out
+
+
 def pick_oa_due(notices: List[Notice], doc_type: str) -> Optional[Notice]:
     """서류명에 문서종류가 들어간 통지서 가운데 가장 최신(발송번호 숫자가 가장 큰) 것."""
     cands = [n for n in notices if doc_type and doc_type in n.title and n.due_date]
@@ -289,3 +311,11 @@ def fetch_reexam(appln: str) -> bool:
     if not num:
         raise KiprisError(f"출원번호를 알아볼 수 없습니다: {appln}")
     return parse_reexam(_send(BIBLIO_PATH, {"applicationNumber": num}, gateway="kipo"))
+
+
+def fetch_documents(appln: str) -> List[Document]:
+    """출원번호의 서류 목록 (서지 상세 호출 1회). 실패하면 KiprisError."""
+    num = appln_number(appln)
+    if not num:
+        raise KiprisError(f"출원번호를 알아볼 수 없습니다: {appln}")
+    return parse_documents(_send(BIBLIO_PATH, {"applicationNumber": num}, gateway="kipo"))

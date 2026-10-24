@@ -1,9 +1,12 @@
 """기한 확인 — 트레이에 있는 동안 12:00(기한일 경고)·17:00(연장 확인)에 NAS `iplog` 차수를 본다. Qt·Outlook 을 모른다.
 
-- 17:00 연장 확인: ChekPat 에서 기연을 의뢰하면 그 차수에 `ext_status='requested'`·`ext_requested_at` 이 적힌다.
-  그날 KIPRIS 마감기한(`ExpirationDuedateDate`, 연장 반영)이 DB 기한보다 늦으면 `due_extended`·`confirmed` 를 적고
-  네이버 대응기한 일정을 새 날짜로 옮긴다. 늘어난 기록이 없으면 `unconfirmed` 를 적고 알린다.
-  기연 요청 없이 KIPRIS 기한이 늦어진 진행 중 차수(대응기한이 가까운 것만 — KIPRIS 호출 수)도 고친다.
+- 17:00 연장 확인: ChekPat 에서 기연을 의뢰하면 그 차수에 `ext_status='requested'`·`ext_requested_at`·`ext_months`
+  가 적힌다. 회사 담당자는 보통 17:00 전에 기간연장신청서를 낸다. 그날 KIPRIS 서지 상세 서류 목록에 요청일 이후
+  접수된 `[지정기간연장]`·`[법정기간연장]` 서류가 있으면(「접수중」 이어도) `confirmed` 를 적고, 연장 월수를 알면
+  `due_extended`(대응기한 + 월수)를 적고 네이버 대응기한 일정을 옮긴다. 없으면 `unconfirmed` 를 적고 알린다(요청 뒤
+  EXT_LOOKBACK_DAYS 동안 날마다 다시 본다). 마감기한(`ExpirationDuedateDate`)은 「수리」 뒤에야 늘어 그날은 못 쓴다.
+  기연 요청 없이 KIPRIS 기한이 늦어진 진행 중 차수(대응기한이 가까운 것만 — KIPRIS 호출 수)도 고치고, 월수로 셈한
+  연장 기한이 KIPRIS 에 반영된 기한과 다르면 KIPRIS 쪽으로 고친다.
 - 12:00 기한일 경고: 오늘이 대응기한(`COALESCE(due_extended, due_date)`)인데 제출도 기연(확인)도 없는 진행 중 차수.
 - 마지막으로 돈 날은 `deadline_state.json` — 앱이 꺼져 있어 놓친 확인은 켤 때 따라잡는다(「늦은 알림」).
 - 알림: 트레이 말풍선(main 이 넘긴 함수) + 네이버 「알림」 캘린더 일정(VALARM) + 로그(History 탭).
@@ -17,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Callable, Dict, List, Optional
 
+from dateutil.relativedelta import relativedelta
+
 import db
 import kipris
 
@@ -26,7 +31,7 @@ DEFAULT_TIMES = {"warn": "12:00", "ext": "17:00"}
 CATCHUP_DAYS = 7                     # 이보다 오래 꺼져 있었으면 그 앞은 따라잡지 않는다
 GRACE = timedelta(minutes=10)        # 정한 시각보다 이만큼 넘게 늦게 돌면 「늦은 알림」
 RETRY_AFTER = timedelta(minutes=10)  # NAS 에 못 닿으면 이만큼 뒤에 다시
-EXT_LOOKBACK_DAYS = 7                # 확인이 실패(KIPRIS 오류)해 아직 requested 인 차수는 요청 뒤 이만큼 다시 본다
+EXT_LOOKBACK_DAYS = 7                # 기연신청서가 안 보였거나 KIPRIS 오류였던 차수는 요청 뒤 이만큼 날마다 다시 본다
 DRIFT_AHEAD_DAYS = 14                # 기연 요청 없이 기한이 바뀌었나 — 대응기한이 이 안에 드는 차수만
 DRIFT_BEHIND_DAYS = 7                #   (기한 당일 기연 → KIPRIS 반영은 하루 이틀 늦다)
 CLOSED_STATUSES = ("completed", "allowed", "abandoned")
@@ -36,7 +41,8 @@ ALERT_LEAD = timedelta(minutes=1)    # 네이버 알림 일정은 지금보다 �
 _OPEN = ("p.submitted_date IS NULL AND (p.status IS NULL OR p.status NOT IN (%s))"
          % ", ".join("'%s'" % s for s in CLOSED_STATUSES))
 _ROUND_COLS = ("p.id, r.ref, r.app_no, p.stage, p.round_n, p.due_date, p.due_extended, p.ext_status, "
-               "p.ext_requested_at, COALESCE(p.due_extended, p.due_date) AS due")
+               "p.ext_requested_at, p.ext_months, COALESCE(p.due_extended, p.due_date) AS due")
+_EXT_DOC = re.compile(r"\[(지정|법정)기간연장\]")   # 「[지정기간연장]기간 연장신청서·…」 — 「법정기간연장승인서」 는 아니다
 
 
 @dataclass
@@ -165,7 +171,7 @@ def check_deadlines(conn, day: date, today: Optional[date] = None) -> List[Alert
     if not rows:
         logging.info(f"기한일 경고 {day}: 제출·기연 없는 차수 없음")
         return []
-    lines = [round_label(r) + (" — 기연 의뢰했으나 KIPRIS 확인 안 됨" if r.get("ext_status") == "unconfirmed" else "")
+    lines = [round_label(r) + (" — 기연 의뢰했으나 기연신청서 제출 확인 안 됨" if r.get("ext_status") == "unconfirmed" else "")
              for r in rows]
     when = "오늘" if day == (today or date.today()) else day.isoformat()
     return [Alert(f"대응기한 {when} — 제출·기연 없음 {len(rows)}건",
@@ -195,7 +201,7 @@ class _KiprisCache:
     def __init__(self, fetch):
         self.fetch, self.got = fetch, {}
 
-    def due(self, row: dict) -> Optional[date]:
+    def get(self, row: dict):
         app_no = row.get("app_no") or ""
         if app_no not in self.got:
             try:
@@ -205,7 +211,19 @@ class _KiprisCache:
         got = self.got[app_no]
         if isinstance(got, Exception):
             raise got
-        return round_due(got, row.get("stage") or "")
+        return got
+
+    def due(self, row: dict) -> Optional[date]:
+        return round_due(self.get(row), row.get("stage") or "")
+
+
+def extension_filed(docs: List[kipris.Document], since: date) -> Optional[kipris.Document]:
+    """since(기연 요청일) 이후 접수된 기간연장신청서 가운데 처음 것. 처리 상태(접수중·수리)는 따지지 않는다."""
+    for doc in docs:
+        received = as_date(doc.receipt_date)
+        if _EXT_DOC.search(doc.name) and received and received >= since:
+            return doc
+    return None
 
 
 def _move(mover, row, olds, new_day) -> str:
@@ -216,38 +234,48 @@ def _move(mover, row, olds, new_day) -> str:
         return f"⚠ 일정 옮기기 실패({e}) — 네이버에서 직접 옮기세요"
 
 
-def check_extensions(conn, day: date, fetch_due=kipris.fetch_due_dates, mover=None, drift=True) -> List[Alert]:
-    """그날 기연을 의뢰한 차수의 연장을 KIPRIS 로 확인한다(+ drift 면 요청 없이 기한이 바뀐 차수).
+def check_extensions(conn, day: date, fetch_docs=kipris.fetch_documents, fetch_due=kipris.fetch_due_dates,
+                     mover=None, drift=True) -> List[Alert]:
+    """기연을 의뢰한 차수에 기간연장신청서가 들어갔는지 KIPRIS 서류 목록으로 확인한다(+ drift 면 KIPRIS 기한이 바뀐 차수).
 
     mover(row, 옛 날짜들, 새 날짜) → 결과 글. 고친 값은 커밋하지 않는다(부르는 쪽이 커밋).
     """
-    kip = _KiprisCache(fetch_due)
-    confirmed, unconfirmed, failed, drifted = [], [], [], []
+    docs, kip = _KiprisCache(fetch_docs), _KiprisCache(fetch_due)
+    confirmed, unconfirmed, failed, drifted, corrected = [], [], [], [], []
     with conn.cursor() as cur:
         cur.execute(f"SELECT {_ROUND_COLS} FROM projects p JOIN refs r ON r.id = p.ref_id"
-                    " WHERE p.ext_status = 'requested' AND DATE(p.ext_requested_at) BETWEEN %s AND %s"
+                    " WHERE p.ext_status IN ('requested', 'unconfirmed') AND DATE(p.ext_requested_at) BETWEEN %s AND %s"
                     " ORDER BY r.ref, p.round_n",
                     ((day - timedelta(days=EXT_LOOKBACK_DAYS)).isoformat(), day.isoformat()))
         requested = cur.fetchall()
         for row in requested:
             label, current = round_label(row), as_date(row.get("due"))
+            since = as_date(row.get("ext_requested_at")) or day
             try:
-                new = kip.due(row)
+                filed = extension_filed(docs.get(row), since)
             except kipris.KiprisError as e:
                 logging.error(f"연장 확인 KIPRIS 실패: {label} — {e}")
                 failed.append(f"{label} — KIPRIS 조회 실패({e}), 내일 다시 확인")
                 continue
-            if current and new and new > current:
+            if not filed:
+                if row.get("ext_status") != "unconfirmed":
+                    cur.execute("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (row["id"],))
+                logging.warning(f"기연신청서 제출 확인 안 됨: {label} — {since} 이후 접수된 기간연장신청서 없음")
+                unconfirmed.append(f"{label} — {since} 이후 낸 기간연장신청서가 KIPRIS 에 없음")
+                continue
+            months = row.get("ext_months")
+            new = current + relativedelta(months=int(months)) if current and months else None
+            if new:
                 cur.execute("UPDATE projects SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
                             (new.isoformat(), row["id"]))
                 moved = _move(mover, row, [current, as_date(row.get("due_date"))], new) if mover else ""
-                logging.info(f"기간연장 확인: {label} {current} → {new} ({moved})")
-                confirmed.append(f"{label}: {current} → {new}" + (f" · {moved}" if moved else ""))
+                change = f"{current} → {new}" + (f" · {moved}" if moved else "")
             else:
-                cur.execute("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (row["id"],))
-                why = "DB 에 대응기한이 없음" if not current else f"KIPRIS 기한 {new or '없음'} (DB {current})"
-                logging.warning(f"기간연장 확인 안 됨: {label} — {why}")
-                unconfirmed.append(f"{label} — {why}")
+                cur.execute("UPDATE projects SET ext_status = 'confirmed' WHERE id = %s", (row["id"],))
+                change = "연장 월수를 몰라 대응기한·일정은 그대로 — KIPRIS 기한이 늘면 고칩니다"
+            text = f"기연신청서 {filed.receipt_date} {filed.status} · {change}"
+            logging.info(f"기연신청서 제출 확인: {label} — {text}")
+            confirmed.append(f"{label}: {text}")
 
         if drift:
             done = {r["id"] for r in requested}
@@ -266,22 +294,30 @@ def check_extensions(conn, day: date, fetch_due=kipris.fetch_due_dates, mover=No
                 except kipris.KiprisError as e:
                     logging.error(f"기한 변경 확인 KIPRIS 실패: {label} — {e}")
                     continue
-                if not (current and new and new > current):
+                # 늘었거나, 월수로 셈한 연장 기한이 KIPRIS 에 반영된 기한(처음 기한보다 늦음)과 다르면 고친다
+                floor = min(d for d in (current, as_date(row.get("due_date"))) if d) if current else None
+                if not (current and new and new != current and new > floor):
                     continue
                 status = "confirmed" if row.get("ext_status") == "unconfirmed" else row.get("ext_status")
                 cur.execute("UPDATE projects SET due_extended = %s, ext_status = %s WHERE id = %s",
                             (new.isoformat(), status or None, row["id"]))
                 moved = _move(mover, row, [current, as_date(row.get("due_date"))], new) if mover else ""
-                logging.info(f"기연 요청 없이 KIPRIS 기한이 바뀜: {label} {current} → {new} ({moved})")
-                drifted.append(f"{label}: {current} → {new}" + (f" · {moved}" if moved else ""))
+                line = f"{label}: {current} → {new}" + (f" · {moved}" if moved else "")
+                if row.get("ext_status") == "confirmed":
+                    logging.info(f"연장 기한을 KIPRIS 반영 기한으로 고침: {label} {current} → {new} ({moved})")
+                    corrected.append(line)
+                else:
+                    logging.info(f"기연 요청 없이 KIPRIS 기한이 바뀜: {label} {current} → {new} ({moved})")
+                    drifted.append(line)
 
-    if not (requested or drifted):
+    if not (requested or drifted or corrected):
         logging.info(f"연장 확인 {day}: 기연 의뢰한 차수 없음")
     alerts = []
-    for title, lines in ((f"기간연장 확인 안 됨 {len(unconfirmed)}건", unconfirmed),
+    for title, lines in ((f"기연신청서 제출 확인 안 됨 {len(unconfirmed)}건", unconfirmed),
                          (f"기간연장 확인 실패 {len(failed)}건", failed),
-                         (f"기간연장 확인 {len(confirmed)}건 — 대응기한 일정을 옮겼습니다", confirmed),
-                         (f"기연 요청 없이 대응기한이 바뀜 {len(drifted)}건", drifted)):
+                         (f"기연신청서 제출 확인 {len(confirmed)}건", confirmed),
+                         (f"기연 요청 없이 대응기한이 바뀜 {len(drifted)}건", drifted),
+                         (f"연장 기한이 KIPRIS 와 달라 고침 {len(corrected)}건", corrected)):
         if lines:
             alerts.append(Alert(title, lines, day=day))
     return alerts
@@ -293,11 +329,12 @@ class Watcher:
     """tick(now) 을 자주(1분마다) 부르면 정한 시각이 지난 확인을 돌린다. 스레드 하나에서만 부른다."""
 
     def __init__(self, state_path: str, times_fn: Callable[[], dict], connect=None, fetch_due=None,
-                 mover_factory: Optional[Callable[[], Callable]] = None):
+                 mover_factory: Optional[Callable[[], Callable]] = None, fetch_docs=None):
         self.state_path = state_path
         self.times_fn = times_fn
         self.connect = connect or db.connect
         self.fetch_due = fetch_due or kipris.fetch_due_dates
+        self.fetch_docs = fetch_docs or kipris.fetch_documents
         self.mover_factory = mover_factory
         self._retry_at: Optional[datetime] = None
 
@@ -328,7 +365,7 @@ class Watcher:
                     if kind == "warn":
                         got = check_deadlines(conn, day, now.date())
                     else:
-                        got = check_extensions(conn, day, self.fetch_due,
+                        got = check_extensions(conn, day, self.fetch_docs, self.fetch_due,
                                                mover if self.mover_factory else None, drift=(day == last_ext))
                     conn.commit()
                 finally:

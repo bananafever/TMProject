@@ -60,14 +60,21 @@ class FakeConn:
 
 
 def _round(id_, ref="PA-2T8084", stage="의견제출통지서", due_date=date(2026, 10, 24), due_extended=None,
-           ext_status=None, app_no="10-2025-7000694", round_n=2):
+           ext_status=None, app_no="10-2025-7000694", round_n=2, ext_requested_at=None, ext_months=None):
     return {"id": id_, "ref": ref, "app_no": app_no, "stage": stage, "round_n": round_n, "due_date": due_date,
-            "due_extended": due_extended, "ext_status": ext_status, "ext_requested_at": None,
-            "due": due_extended or due_date}
+            "due_extended": due_extended, "ext_status": ext_status, "ext_requested_at": ext_requested_at,
+            "ext_months": ext_months, "due": due_extended or due_date}
 
 
 def _notice(due, title="의견제출통지서", send="9520260000001"):
     return kipris.Notice(send_number=send, title=title, due_date=due)
+
+
+EXT_NAME = "[지정기간연장]기간 연장신청서·기간 단축신청서·기간 경과 구제신청서·절차 계속신청서"
+
+
+def _doc(received, name=EXT_NAME, status="접수중"):
+    return kipris.Document(name=name, receipt_date=received, status=status, number="1-1-2026-1315776-24")
 
 
 class TestDueRuns(unittest.TestCase):
@@ -111,7 +118,7 @@ class TestCheckDeadlines(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0].title, "대응기한 오늘 — 제출·기연 없음 2건")
         self.assertEqual(alerts[0].lines, ["PA-2T8084 R2 의견제출통지서",
-                                           "PA-2T9001 R1 거절결정서 — 기연 의뢰했으나 KIPRIS 확인 안 됨"])
+                                           "PA-2T9001 R1 거절결정서 — 기연 의뢰했으나 기연신청서 제출 확인 안 됨"])
 
     def test_nothing_no_alert(self):
         self.assertEqual(dw.check_deadlines(FakeConn(lambda s, p: []), date(2026, 10, 24)), [])
@@ -122,85 +129,160 @@ class TestCheckDeadlines(unittest.TestCase):
 
 
 class TestCheckExtensions(unittest.TestCase):
-    DAY = date(2026, 10, 24)
+    DAY = date(2026, 10, 23)
+    ASKED = datetime(2026, 10, 23, 10, 30)
 
     def _conn(self, requested, drift=()):
         def respond(sql, params):
-            return list(requested) if "ext_status = 'requested'" in sql else list(drift)
+            return list(requested) if "ext_status IN ('requested', 'unconfirmed')" in sql else list(drift)
         return FakeConn(respond)
 
-    def test_confirmed_moves_event(self):
-        conn = self._conn([_round(7, due_date=date(2026, 11, 2))])
+    def _asked(self, id_=7, **kw):
+        kw.setdefault("due_date", date(2026, 11, 23))
+        kw.setdefault("ext_status", "requested")
+        return _round(id_, ext_requested_at=self.ASKED, **kw)
+
+    def test_filed_today_moves_event_by_months(self):
+        """10-2021-7008131 처럼 — 옛 연장신청서(수리)는 빼고, 그날 낸 것(접수중)으로 확인. 마감기한은 아직 그대로"""
+        conn = self._conn([self._asked(ext_months=1)])
         mover = MagicMock(return_value="일정 옮김")
-        alerts = dw.check_extensions(conn, self.DAY, fetch_due=lambda app: [_notice("2026-12-02")], mover=mover,
-                                     drift=False)
+        docs = [_doc("2024-11-18", status="수리"), _doc("2026-10-23")]
+        alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: docs, mover=mover, drift=False)
         self.assertEqual(conn.updates(), [("UPDATE projects SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
-                                           ("2026-12-02", 7))])
+                                           ("2026-12-23", 7))])
         row, olds, new = mover.call_args.args
-        self.assertEqual((row["id"], olds, new), (7, [date(2026, 11, 2), date(2026, 11, 2)], date(2026, 12, 2)))
-        self.assertEqual([a.title for a in alerts], ["기간연장 확인 1건 — 대응기한 일정을 옮겼습니다"])
+        self.assertEqual((row["id"], olds, new), (7, [date(2026, 11, 23), date(2026, 11, 23)], date(2026, 12, 23)))
+        self.assertEqual([a.title for a in alerts], ["기연신청서 제출 확인 1건"])
+        self.assertIn("기연신청서 2026-10-23 접수중 · 2026-11-23 → 2026-12-23 · 일정 옮김", alerts[0].lines[0])
         sql, params = conn.executed[0]
         self.assertIn("DATE(p.ext_requested_at) BETWEEN %s AND %s", sql)
-        self.assertEqual(params, ("2026-10-17", "2026-10-24"))
+        self.assertIn("p.ext_months", sql)
+        self.assertEqual(params, ("2026-10-16", "2026-10-23"))
 
-    def test_not_extended_is_unconfirmed(self):
-        conn = self._conn([_round(7, due_date=date(2026, 11, 2))])
+    def test_not_filed_is_unconfirmed(self):
+        """요청일 전의 연장신청서·연장승인서는 이번 기연이 아니다"""
+        conn = self._conn([self._asked(ext_months=1)])
         mover = MagicMock()
-        alerts = dw.check_extensions(conn, self.DAY, fetch_due=lambda app: [_notice("2026-11-02")], mover=mover,
-                                     drift=False)
+        docs = [_doc("2026-10-20"), _doc("2026-10-23", name="법정기간연장승인서", status="발송처리완료")]
+        alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: docs, mover=mover, drift=False)
         self.assertEqual(conn.updates(), [("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (7,))])
         mover.assert_not_called()
-        self.assertEqual(alerts[0].title, "기간연장 확인 안 됨 1건")
-        self.assertIn("KIPRIS 기한 2026-11-02 (DB 2026-11-02)", alerts[0].lines[0])
+        self.assertEqual(alerts[0].title, "기연신청서 제출 확인 안 됨 1건")
+        self.assertIn("2026-10-23 이후 낸 기간연장신청서가 KIPRIS 에 없음", alerts[0].lines[0])
+
+    def test_unconfirmed_rechecked_next_day(self):
+        """17:00 뒤에 냈으면 다음 날 확인된다. 아직 없으면 다시 알리되 DB 는 그대로"""
+        row = self._asked(ext_status="unconfirmed", ext_months=2)
+        conn = self._conn([row])
+        alerts = dw.check_extensions(conn, date(2026, 10, 24), fetch_docs=lambda app: [_doc("2026-10-23")],
+                                     mover=None, drift=False)
+        self.assertEqual(conn.updates()[0][1], ("2027-01-23", 7))
+        self.assertEqual(alerts[0].title, "기연신청서 제출 확인 1건")
+        conn = self._conn([row])
+        alerts = dw.check_extensions(conn, date(2026, 10, 24), fetch_docs=lambda app: [], mover=None, drift=False)
+        self.assertEqual(conn.updates(), [])
+        self.assertEqual(alerts[0].title, "기연신청서 제출 확인 안 됨 1건")
+
+    def test_months_unknown_confirms_without_moving(self):
+        conn = self._conn([self._asked()])
+        mover = MagicMock()
+        alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: [_doc("2026-10-23")], mover=mover,
+                                     drift=False)
+        self.assertEqual(conn.updates(), [("UPDATE projects SET ext_status = 'confirmed' WHERE id = %s", (7,))])
+        mover.assert_not_called()
+        self.assertIn("연장 월수를 몰라", alerts[0].lines[0])
+
+    def test_statutory_extension_counts(self):
+        """거절결정 뒤 기간은 「[법정기간연장]…」"""
+        conn = self._conn([self._asked(stage="거절결정서", ext_months=1)])
+        name = "[법정기간연장]기간 연장신청서·기간 단축신청서·기간 경과 구제신청서·절차 계속신청서"
+        dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: [_doc("2026-10-23", name=name, status="수리")],
+                            mover=None, drift=False)
+        self.assertEqual(conn.updates()[0][1], ("2026-12-23", 7))
 
     def test_kipris_failure_keeps_requested(self):
-        conn = self._conn([_round(7)])
+        conn = self._conn([self._asked()])
 
         def fail(app):
             raise kipris.KiprisError("연결 실패")
-        alerts = dw.check_extensions(conn, self.DAY, fetch_due=fail, mover=MagicMock(), drift=False)
+        alerts = dw.check_extensions(conn, self.DAY, fetch_docs=fail, mover=MagicMock(), drift=False)
         self.assertEqual(conn.updates(), [])
         self.assertEqual(alerts[0].title, "기간연장 확인 실패 1건")
 
-    def test_second_extension_compares_with_extended(self):
-        conn = self._conn([_round(7, due_date=date(2026, 11, 2), due_extended=date(2026, 12, 2))])
+    def test_second_extension_adds_to_extended(self):
+        conn = self._conn([self._asked(due_extended=date(2026, 12, 23), ext_months=1)])
         mover = MagicMock(return_value="")
-        dw.check_extensions(conn, self.DAY, fetch_due=lambda app: [_notice("2027-01-02")], mover=mover, drift=False)
-        self.assertEqual(conn.updates()[0][1], ("2027-01-02", 7))
-        self.assertEqual(mover.call_args.args[1], [date(2026, 12, 2), date(2026, 11, 2)])
+        dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: [_doc("2026-10-23")], mover=mover, drift=False)
+        self.assertEqual(conn.updates()[0][1], ("2027-01-23", 7))
+        self.assertEqual(mover.call_args.args[1], [date(2026, 12, 23), date(2026, 11, 23)])
 
     def test_drift_without_request(self):
-        requested = [_round(7, due_date=date(2026, 11, 2))]
+        requested = [self._asked(due_date=date(2026, 11, 2))]
         drift = [_round(7, due_date=date(2026, 11, 2)),           # 위에서 본 차수 — 다시 보지 않는다
                  _round(8, ref="PA-2T9001", app_no="10-2024-0000001", due_date=date(2026, 10, 30)),
                  _round(9, ref="PA-2T9002", app_no="10-2024-0000002", due_date=date(2026, 10, 30),
                         ext_status="unconfirmed"),
                  _round(10, ref="PA-2T9003", app_no="10-2024-0000003", due_date=date(2026, 10, 30))]
-        dues = {"10-2025-7000694": "2026-12-02", "10-2024-0000001": "2026-11-30", "10-2024-0000002": "2026-11-30",
-                "10-2024-0000003": "2026-10-30"}
+        dues = {"10-2024-0000001": "2026-11-30", "10-2024-0000002": "2026-11-30", "10-2024-0000003": "2026-10-30"}
         calls = []
 
         def fetch(app):
             calls.append(app)
             return [_notice(dues[app])]
         conn = self._conn(requested, drift)
-        alerts = dw.check_extensions(conn, self.DAY, fetch_due=fetch, mover=MagicMock(return_value="옮김"))
-        self.assertEqual(calls, ["10-2025-7000694", "10-2024-0000001", "10-2024-0000002", "10-2024-0000003"])
+        alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: [], fetch_due=fetch,
+                                     mover=MagicMock(return_value="옮김"))
+        self.assertEqual(calls, ["10-2024-0000001", "10-2024-0000002", "10-2024-0000003"])
         ups = conn.updates()
+        self.assertEqual(ups[0], ("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (7,)))
         self.assertEqual(ups[1], ("UPDATE projects SET due_extended = %s, ext_status = %s WHERE id = %s",
                                   ("2026-11-30", None, 8)))
         self.assertEqual(ups[2][1], ("2026-11-30", "confirmed", 9))
         self.assertEqual(len(ups), 3)
         drift_sql, drift_params = conn.executed[2]
         self.assertIn("p.ext_status <> 'requested'", drift_sql)
-        self.assertEqual(drift_params, ("2026-10-17", "2026-11-07"))
+        self.assertEqual(drift_params, ("2026-10-16", "2026-11-06"))
         self.assertEqual(alerts[-1].title, "기연 요청 없이 대응기한이 바뀜 2건")
 
+    def test_drift_corrects_counted_extension(self):
+        """월수로 셈한 12-23 이 KIPRIS 수리 뒤 12-20 이면 고친다. KIPRIS 가 아직 처음 기한(11-23)이면 두고 본다"""
+        row = _round(7, due_date=date(2026, 11, 23), due_extended=date(2026, 12, 23), ext_status="confirmed")
+        for kipris_due, expect in (("2026-12-20", [("2026-12-20", "confirmed", 7)]), ("2026-11-23", []),
+                                   ("2026-12-23", [])):
+            conn = self._conn([], [row])
+            mover = MagicMock(return_value="옮김")
+            alerts = dw.check_extensions(conn, date(2026, 12, 10), fetch_docs=lambda app: [],
+                                         fetch_due=lambda app: [_notice(kipris_due)], mover=mover)
+            self.assertEqual([p for _s, p in conn.updates()], expect)
+            if expect:
+                self.assertEqual(mover.call_args.args[1:], ([date(2026, 12, 23), date(2026, 11, 23)],
+                                                            date(2026, 12, 20)))
+                self.assertEqual(alerts[-1].title, "연장 기한이 KIPRIS 와 달라 고침 1건")
+            else:
+                self.assertEqual(alerts, [])
+
     def test_one_kipris_call_per_app_no(self):
-        rows = [_round(1), _round(2, round_n=3)]
-        fetch = MagicMock(return_value=[_notice("2026-12-02")])
-        dw.check_extensions(self._conn(rows), self.DAY, fetch_due=fetch, mover=None, drift=False)
+        rows = [self._asked(1), self._asked(2, round_n=3)]
+        fetch = MagicMock(return_value=[_doc("2026-10-23")])
+        dw.check_extensions(self._conn(rows), self.DAY, fetch_docs=fetch, mover=None, drift=False)
         fetch.assert_called_once_with("10-2025-7000694")
+
+    def test_parse_documents(self):
+        xml = ("<response><header><successYN>Y</successYN><resultCode>00</resultCode></header><body><item>"
+               "<biblioSummaryInfo><applicationNumber>1020217008131</applicationNumber>"
+               "<finalDisposal>거절결정 후 재심사중</finalDisposal></biblioSummaryInfo>"
+               "<legalStatusInfoArray><legalStatusInfo><commonCodeName>수리 (Accepted)</commonCodeName>"
+               "<documentEngName/><documentName>[지정기간연장]기간 연장신청서</documentName>"
+               "<receiptDate>2024.11.18</receiptDate><receiptNumber>1-1-2024-1262771-06</receiptNumber>"
+               "</legalStatusInfo><legalStatusInfo><commonCodeName>접수중 (On receiving)</commonCodeName>"
+               "<documentEngName/><documentName>" + EXT_NAME + "</documentName>"
+               "<receiptDate>2026.10.23</receiptDate><receiptNumber>1-1-2026-1315776-24</receiptNumber>"
+               "</legalStatusInfo></legalStatusInfoArray></item></body></response>")
+        docs = kipris.parse_documents(xml)
+        self.assertEqual(docs, [kipris.Document("[지정기간연장]기간 연장신청서", "2024-11-18", "수리", "1-1-2024-1262771-06"),
+                                kipris.Document(EXT_NAME, "2026-10-23", "접수중", "1-1-2026-1315776-24")])
+        self.assertEqual(dw.extension_filed(docs, date(2026, 10, 23)), docs[1])
+        self.assertIsNone(dw.extension_filed(docs, date(2026, 10, 24)))
 
     def test_round_due_by_stage(self):
         notices = [_notice("2026-11-02", "의견제출통지서", "9520260000001"),
@@ -276,7 +358,7 @@ class TestWatcher(unittest.TestCase):
     def test_drift_only_on_last_ext_day(self):
         dw.save_state(self.path, {"warn": "2026-10-24", "ext": "2026-10-21"})
         seen = []
-        with patch.object(dw, "check_extensions", side_effect=lambda conn, day, fetch, mover, drift: seen.append(
+        with patch.object(dw, "check_extensions", side_effect=lambda conn, day, docs, due, mover, drift: seen.append(
                 (day, drift)) or []):
             dw.Watcher(self.path, lambda: {}, connect=lambda: FakeConn(lambda s, p: [])).tick(
                 datetime(2026, 10, 24, 18, 0))
