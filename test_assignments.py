@@ -221,5 +221,32 @@ class TestRecordAssignmentsInFlow(unittest.TestCase):
             self.assertIsNone(main.record_assignments([self._delegation("A")]))
 
 
+    def test_doc_kind_of_delegation(self):
+        """위임 서류 종류 — 의견제출통지서·거절결정서만 일정, 등록결정·보정요구서는 「OTHER」(10-24 사용자: 일정 없음)."""
+        kind = lambda s: main.rejection_type_of(MagicMock(Subject=s))      # noqa: E731
+        self.assertEqual(kind("[위임] PA-2T8084; 한송희(팀); OA [서 2026-10-01]; 001"), "OA")
+        self.assertEqual(kind("[위임] PA-2T8084; 한송희(팀); 의견제출통지서 [서 2026-10-01]; 001"), "OA")
+        self.assertEqual(kind("[위임] PA-2T8084; 한송희(팀); 최후의견제출통지서; 001"), "OA")
+        self.assertEqual(kind("[위임] PA-2T9001; 이여름(팀); 거절결정서 [서 2026-10-05]; 001"), "FR")
+        self.assertEqual(kind("[위임] PA-2T9001; 이여름(팀); 특허거절결정서; 001"), "FR")
+        self.assertEqual(kind("[위임] PA-2T9002; 이여름(팀); 특허결정서 [서 2026-10-05]; 001"), main.OTHER_DOC)
+        self.assertEqual(kind("[위임] PA-T2K6503; 이예진(팀); 보정요구서; 001"), main.OTHER_DOC)
+        self.assertEqual(kind("[위임] PA-2T8084; 한송희(팀); 001"), "OA")                 # 서류 이름 없음 — 예전처럼
+
+    def test_other_delegation_records_but_no_schedule(self):
+        """등록결정 위임 — 네이버 일정은 만들지 않고(Session 을 부르지 않음) 처리 표시·받은 위임 기록만."""
+        m = make_mock_message("[위임] PA-2T9002; 이여름(팀); 특허결정서 [서 2026-10-05]; 001",
+                              date.today().year, date.today().month, date.today().day)
+        m.EntryID = "D"
+        conn = FakeConn()
+        with patch.object(db, "connect", return_value=conn), \
+                patch.object(main.naver_cal, "Session", side_effect=AssertionError("일정을 만들면 안 된다")), \
+                patch.object(main, "ScheduleDialog", side_effect=AssertionError("창을 띄우면 안 된다")):
+            self.assertEqual(main.register_delegation(m, always_show=True), [])
+        self.assertIn("D", main.load_calendar_state()["done"])
+        self.assertEqual(set(conn.rows), {"D"})
+        self.assertEqual(conn.rows["D"][db.ASSIGNMENT_COLUMNS.index("doc_type")], "특허결정서")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

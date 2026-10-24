@@ -1081,8 +1081,26 @@ def is_calendar_delegation(message):
     return sender_matches(message, CALENDAR_SENDERS)
 
 
+OTHER_DOC = "OTHER"            # 의견제출통지서·거절결정서가 아닌 위임(등록결정·보정요구서 …) — 일정을 만들지 않는다(10-24 사용자)
+_OA_WORD = re.compile(r"의견\s*제출\s*통지|^OA$|office\s*action", re.I)
+
+
+def delegation_doc(subject):
+    """위임 메일 제목의 서류 이름 — 「…; 거절결정서 [서 …]」·「…; 보정요구서; …」. 없으면 ""."""
+    m = _DOC_BEFORE_SEO.search(subject or "") or _DOC_NAMED.search(subject or "")
+    return squash(m.group(1)) if m else ""
+
+
 def rejection_type_of(message):
-    return "FR" if "거절결정서" in message.Subject else "OA"
+    """「FR」(거절결정) · 「OA」(의견제출통지서, 서류 이름이 없는 예전 꼴도) · 「OTHER」(그 밖의 서류 이름 — 등록결정·보정요구서 …).
+    예전에는 거절결정서가 아니면 모두 OA 로 보아 「_의견서」 일정을 만들었다."""
+    subject = message.Subject or ""
+    doc = delegation_doc(subject)
+    if "거절결정서" in subject or "거절결정" in doc:
+        return "FR"
+    if not doc or _OA_WORD.search(doc):
+        return "OA"
+    return OTHER_DOC
 
 
 # ── 받은 위임 → NAS DB `assignments` (ChekPat 「받은 위임」 목록) ──────────
@@ -1112,7 +1130,8 @@ def assignment_row(message, cache):
     ref = ref_nums[0]
     rejection_type = rejection_type_of(message)
     received = message.CreationTime.date()
-    case = recent_case(find_case(cache, ref, OA_DOC_TYPE if rejection_type == "OA" else FR_DOC_TYPE), received) or {}
+    doc_word = {"OA": OA_DOC_TYPE, "FR": FR_DOC_TYPE}.get(rejection_type) or delegation_doc(subject)  # 보정요구서 …
+    case = recent_case(find_case(cache, ref, doc_word), received) or {}
     seo = _REPORT_DUE.search(subject)
     doc = _DOC_BEFORE_SEO.search(subject) or _DOC_NAMED.search(subject)
     names = name_key.findall(subject)
@@ -1158,6 +1177,12 @@ def register_delegation(message, always_show=True):
     """
     record_assignments([message])  # NAS 에 못 닿아도 일정 등록은 그대로
     rejection_type = rejection_type_of(message)
+    if rejection_type == OTHER_DOC:                     # 등록결정·보정요구서 … — 일정 없음, 받은 위임 기록만(위에서)
+        refs = ref_num_key.findall(message.Subject or "")
+        logging.info(f"일정 없음 — {refs[0] if refs else '?'} {delegation_doc(message.Subject)}: "
+                     f"의견제출통지서·거절결정서가 아닌 위임")
+        mark_done(message.EntryID)
+        return []
     plan = build_schedule(message.Subject, message.CreationTime.date(), rejection_type,
                           load_case_cache(), date.today())
     if plan is None:
