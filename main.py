@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import stat
+import threading
 from datetime import date, datetime, timedelta
 from time import sleep
 
@@ -29,8 +30,6 @@ from PySide6 import QtCore as qtc
 from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
 from PySide6 import QtSvg as qts
-
-import threading
 
 import db
 import deadline_watch
@@ -1269,7 +1268,7 @@ class DeadlineRunner(qtc.QObject):
             self._busy.release()
 
     def _show(self, title, text):
-        self.tray_icon.showMessage(title, text, qtw.QSystemTrayIcon.Warning, 20000)
+        self.tray_icon.showMessage(title, text, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
 
 
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
@@ -1708,7 +1707,7 @@ class MainWin(qtw.QWidget):
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")
 
     def test_db_clicked(self):
-        qtw.QApplication.setOverrideCursor(qtc.Qt.WaitCursor)
+        qtw.QApplication.setOverrideCursor(qtc.Qt.CursorShape.WaitCursor)
         try:
             text, ok = db.test_connection(), True
             record_assignments([], flush=True)  # 못 쓰고 쌓아 둔 받은 위임이 있으면 지금
