@@ -16,13 +16,20 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 # -----------------------------------------------------------------------
 # win32com, PySide6는 실제 Outlook/GUI 없이도 테스트할 수 있도록 mock 처리
+# 진짜를 들일 수 있으면 그대로 쓴다 — 진짜 PySide6 가 이미 들어와 있을 때(pytest-qt 등) 그 밑의 모듈을
+# 가짜로 바꾸면 shiboken 이 Segmentation fault 로 죽는다. 한 묶음이라도 못 들이면 묶음 전체를 가짜로.
 # -----------------------------------------------------------------------
-sys.modules["win32com"] = MagicMock()
-sys.modules["win32com.client"] = MagicMock()
-sys.modules["PySide6"] = MagicMock()
-sys.modules["PySide6.QtWidgets"] = MagicMock()
-sys.modules["PySide6.QtGui"] = MagicMock()
-sys.modules["PySide6.QtCore"] = MagicMock()
+def _fake_unless_importable(names):
+    try:
+        for name in names:
+            __import__(name)
+    except Exception:
+        for name in names:
+            sys.modules[name] = MagicMock()
+
+
+_fake_unless_importable(["win32com", "win32com.client"])
+_fake_unless_importable(["PySide6", "PySide6.QtWidgets", "PySide6.QtGui", "PySide6.QtCore", "PySide6.QtSvg"])
 
 # main 의 logging.basicConfig(filename='app.log') 가 걸리지 않게 — 테스트가 실제 앱 로그에 쓰지 않는다
 logging.getLogger().addHandler(logging.NullHandler())

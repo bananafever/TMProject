@@ -7,7 +7,7 @@ import unittest
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-# test_calendar 가 win32com·PySide6 를 가짜로 바꾸고 임시 데이터 폴더를 정한다 — main 보다 먼저 들인다
+# test_calendar 가 (없으면) win32com·PySide6 를 가짜로 끼우고 임시 데이터 폴더를 정한다 — main 보다 먼저 들인다
 from test_calendar import FR_SUBJECT, OA_SUBJECT, make_mock_message  # noqa: E402
 
 import db  # noqa: E402

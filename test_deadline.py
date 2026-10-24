@@ -6,7 +6,7 @@ import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-# test_calendar 가 win32com·PySide6 를 가짜로 바꾸고 임시 데이터 폴더를 정한다 — main 보다 먼저 들인다
+# test_calendar 가 (없으면) win32com·PySide6 를 가짜로 끼우고 임시 데이터 폴더를 정한다 — main 보다 먼저 들인다
 import test_calendar  # noqa: F401
 
 import deadline_watch as dw  # noqa: E402
