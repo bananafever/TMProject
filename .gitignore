@@ -161,6 +161,8 @@ CLAUDE.md
 settings.json
 case_cache.json
 calendar_state.json
+assignment_state.json
+deadline_state.json
 
 # OS files
 .DS_Store

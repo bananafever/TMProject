@@ -30,6 +30,7 @@ from PySide6 import QtGui as qtg
 from PySide6 import QtWidgets as qtw
 from PySide6 import QtSvg as qts
 
+import db
 import kipris
 import naver_cal
 
@@ -1005,6 +1006,70 @@ def rejection_type_of(message):
     return "FR" if "거절결정서" in message.Subject else "OA"
 
 
+# ── 받은 위임 → NAS DB `assignments` (ChekPat 「받은 위임」 목록) ──────────
+ASSIGNMENT_STATE_FILE = data_path("assignment_state.json")
+_REPORT_DUE = re.compile(r"\[\s*서\s*(\d{4}-\d{2}-\d{2})\s*\]")
+_DOC_BEFORE_SEO = re.compile(r";\s*([^;\[]+?)\s*\[\s*서")
+_DOC_NAMED = re.compile(r";\s*([^;\[]*?(?:통지서|결정서|요구서|결정))\s*(?:\[|;|$)")  # [서] 가 없을 때 (ChekPat 과 같은 규칙)
+
+
+def _valid_iso(text):
+    try:
+        return date.fromisoformat(text or "").isoformat()
+    except ValueError:
+        return None
+
+
+def assignment_row(message, cache):
+    """위임 메일 한 통 → assignments 한 줄 (dict). Ref 가 없으면 None.
+
+    제목: 서류 종류·[서 날짜](보고 기한)·담당자. 예고 메일 캐시(이번 통지서의 것만): 통지 접수일·출원번호·출원인·
+    KIPRIS 대응기한(OA)·재심사 거절결정 여부(FR).
+    """
+    subject = message.Subject
+    ref_nums = ref_num_key.findall(subject)
+    if not ref_nums:
+        return None
+    ref = ref_nums[0]
+    rejection_type = rejection_type_of(message)
+    received = message.CreationTime.date()
+    case = recent_case(find_case(cache, ref, OA_DOC_TYPE if rejection_type == "OA" else FR_DOC_TYPE), received) or {}
+    seo = _REPORT_DUE.search(subject)
+    doc = _DOC_BEFORE_SEO.search(subject) or _DOC_NAMED.search(subject)
+    names = name_key.findall(subject)
+    reexam = case.get("reexam") if rejection_type == "FR" else None
+    return {
+        "mail_entry_id": message.EntryID,
+        "ref": ref,
+        "doc_type": squash(doc.group(1)) if doc else (case.get("doc_type") or None),
+        "notice_date": _valid_iso(case.get("receipt_date")),
+        "report_due": _valid_iso(seo.group(1)) if seo else None,
+        "assigner": names[0][2:] if names else None,
+        "app_no": case.get("app_no") or None,
+        "applicant": squash(case.get("applicant")) or None,
+        "due_date": _valid_iso(case.get("due_date")) if rejection_type == "OA" else None,
+        "reexam": None if reexam is None else int(bool(reexam)),
+        "received_at": message.CreationTime.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def record_assignments(messages, flush=False):
+    """위임 메일들을 NAS assignments 에 쓴다(이미 쓴 메일은 건너뜀). 예외를 내지 않는다.
+
+    못 쓴 줄은 쌓아 두었다가 새 줄을 쓸 때, 또는 flush=True(시작할 때 스캔)면 새 줄이 없어도 다시 쓴다.
+    """
+    try:
+        state = db.load_state(ASSIGNMENT_STATE_FILE)
+        known = set(state["recorded"]) | {p.get("mail_entry_id") for p in state["pending"]}
+        cache = load_case_cache()
+        rows = [row for row in (assignment_row(m, cache) for m in messages if m.EntryID not in known) if row]
+        if rows or (flush and state["pending"]):
+            return db.record(rows, ASSIGNMENT_STATE_FILE)
+    except Exception as e:
+        logging.error(f"받은 위임 NAS 기록 중 오류: {e}", exc_info=True)
+    return None
+
+
 def register_delegation(message, always_show=True):
     """위임 메일 한 통의 일정을 등록하고 기록합니다.
 
@@ -1012,6 +1077,7 @@ def register_delegation(message, always_show=True):
     always_show=False 면(시작할 때 스캔) 바로 등록한 결과는 창 없이 돌려줍니다.
     반환값: [(Ref, 제목, 날짜, 결과), ...]
     """
+    record_assignments([message])  # NAS 에 못 닿아도 일정 등록은 그대로
     rejection_type = rejection_type_of(message)
     plan = build_schedule(message.Subject, message.CreationTime.date(), rejection_type,
                           load_case_cache(), date.today())
@@ -1064,6 +1130,8 @@ def scan_delegations(outlook, days=DELEGATION_SCAN_DAYS):
         (m for m in inbox.Items.Restrict(query) if m.CreationTime.date() >= since and is_calendar_delegation(m)),
         key=lambda m: m.CreationTime,
     )
+    # 받은 위임은 일정 등록 기록과 따로 — 처음 실행·이미 처리한 메일도 NAS 에 없으면 쓴다 (한 번에 붙는다)
+    record_assignments(messages, flush=True)
     state = load_calendar_state()
     if state is None:
         state = {"done": {m.EntryID: date.today().isoformat() for m in messages}, "pending": []}
