@@ -672,6 +672,62 @@ def abbr_table_from_rows(rows):
     return table
 
 
+# 약칭 표는 NAS `applicant_abbr` 가 기준이다(10-24 사용자). settings.json 은 NAS 에 못 닿을 때 쓰는 사본.
+def merge_abbr(local, remote):
+    """(합친 표, NAS 로 올릴 것) — 같은 명칭은 NAS 가 이기고, 이 PC 에만 있던 명칭은 올린다. 명칭은 squash 로 맞춘다."""
+    remote = {squash(k): v for k, v in (remote or {}).items() if squash(k) and squash(v)}
+    local = {squash(k): v for k, v in (local or {}).items() if squash(k) and squash(v)}
+    upload = {k: v for k, v in local.items() if k not in remote}
+    merged = dict(local)
+    merged.update(remote)
+    return merged, upload
+
+
+def sync_abbr(connect_fn=None):
+    """켤 때 — NAS 약칭 표와 settings.json 을 합친다. 합친 표(바뀌었을 때만 settings.json 저장) 또는 None(NAS 없음)."""
+    try:
+        conn = (connect_fn or db.connect)()
+    except Exception as e:                              # noqa: BLE001 — NAS 가 없으면 파일 그대로
+        logging.info(f"출원인 약칭 — NAS 에 닿지 않아 settings.json 의 표를 씁니다: {e}")
+        return None
+    try:
+        merged, upload = merge_abbr(config.get("applicant_abbr"), db.load_abbr(conn))
+        if upload:
+            db.save_abbr(conn, upload)
+    except Exception as e:                              # noqa: BLE001
+        logging.warning(f"출원인 약칭 NAS 맞추기 실패: {e}")
+        return None
+    finally:
+        conn.close()
+    if merged != config.get("applicant_abbr"):
+        config["applicant_abbr"] = merged
+        save_config()
+    logging.info(f"출원인 약칭 NAS 맞춤 — {len(merged)}개(이 PC 에서 올림 {len(upload)})")
+    return merged
+
+
+def abbr_changes(loaded, saved):
+    """설정 창 저장 — 처음 채운 표(loaded)와 견줘 (고친·더한 것, 지운 명칭)."""
+    changed = {k: v for k, v in saved.items() if loaded.get(k) != v}
+    return changed, [k for k in loaded if k not in saved]
+
+
+def push_abbr(changed, removed, connect_fn=None):
+    """설정 창에서 고친·지운 약칭을 NAS 에. 실패하면 False — 고친 것은 다음에 켤 때 올라가지만 지운 것은 NAS 에 남는다."""
+    try:
+        conn = (connect_fn or db.connect)()
+        try:
+            wrote, deleted = db.save_abbr(conn, changed, removed)
+        finally:
+            conn.close()
+    except Exception as e:                              # noqa: BLE001
+        logging.warning(f"출원인 약칭을 NAS 에 적지 못했습니다(고친 {len(changed)} · 지운 {len(removed)}) — "
+                        f"지운 명칭은 NAS 에 남아 다음에 켤 때 되살아날 수 있습니다: {e}")
+        return False
+    logging.info(f"출원인 약칭 NAS 기록 — 고침 {wrote} · 지움 {deleted}")
+    return True
+
+
 def fr_action(ref_num, case):
     """거절결정서 Action 일정 제목을 정합니다. 예고 메일 때 저장한 재심사 여부만 씁니다.
 
@@ -1333,6 +1389,20 @@ def deadline_times():
     return deadline_watch.parse_times(config.get("deadline_times"))
 
 
+class AbbrSync(qtc.QObject):
+    """켤 때 약칭 표를 NAS 와 맞춘다(뒤 스레드 — NAS 접속이 GUI 를 막지 않게). 끝나면 `done(표)` 로 설정 창을 새로 채운다."""
+
+    done = qtc.Signal(dict)
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        merged = sync_abbr()
+        if merged is not None:
+            self.done.emit(merged)
+
+
 class DeadlineRunner(qtc.QObject):
     """1분마다 확인할 때가 됐는지 보고, 됐으면 스레드에서 NAS·KIPRIS 를 본다. 알림 말풍선은 GUI 스레드에서."""
 
@@ -1613,6 +1683,7 @@ class MainWin(qtw.QWidget):
                                         | qtw.QAbstractItemView.AnyKeyPressed)
         for name, abbr in sorted((config.get("applicant_abbr") or {}).items()):
             self._add_abbr_row(name, abbr)
+        self._abbr_loaded = dict(config.get("applicant_abbr") or {})   # 저장할 때 NAS 에 고친·지운 것을 가르는 기준
         abbr_box.addWidget(self.abbr_table, 1)
         abbr_box.addWidget(hint(
             f"표에 없거나 약칭을 비운 출원인은 자동 약칭(법인 표기·공백 제거 후 앞 {ABBR_LEN}자)을 씁니다. "
@@ -1768,6 +1839,20 @@ class MainWin(qtw.QWidget):
         for row in sorted({i.row() for i in self.abbr_table.selectedIndexes()}, reverse=True):
             self.abbr_table.removeRow(row)
 
+    def _abbr_rows(self):
+        return abbr_table_from_rows((self._abbr_cell(r, 0), self._abbr_cell(r, 1)) for r in range(self.abbr_table.rowCount()))
+
+    def reload_abbr_table(self, table):
+        """켤 때 NAS 와 맞춘 표로 다시 채운다 — 설정 창에 저장 안 한 고침이 있으면 건드리지 않는다."""
+        if self._abbr_rows() != self._abbr_loaded:
+            logging.info("출원인 약칭 — 설정 창에 저장 안 한 고침이 있어 NAS 표로 새로 채우지 않았습니다.")
+            return
+        self.abbr_table.setRowCount(0)
+        for name, abbr in sorted(table.items()):
+            self._add_abbr_row(name, abbr)
+        self.filter_abbr_rows(self.abbr_search.text())
+        self._abbr_loaded = dict(table)
+
     def _abbr_cell(self, row, col):
         item = self.abbr_table.item(row, col)
         return item.text() if item else ""
@@ -1798,9 +1883,12 @@ class MainWin(qtw.QWidget):
         config["target_path"] = self.target_path_edit.text()
         config["calendar_assignees"] = parse_names(self.assignees_edit.text()) or DEFAULT_CONFIG["calendar_assignees"]
         self.assignees_edit.setText(", ".join(config["calendar_assignees"]))
-        config["applicant_abbr"] = abbr_table_from_rows(
-            (self._abbr_cell(r, 0), self._abbr_cell(r, 1)) for r in range(self.abbr_table.rowCount())
-        )
+        config["applicant_abbr"] = self._abbr_rows()
+        # NAS 약칭 표에도 — 처음 채운(또는 마지막으로 맞춘) 표와 견줘 고친·지운 명칭만, 뒤 스레드로
+        changed, removed = abbr_changes(self._abbr_loaded, config["applicant_abbr"])
+        if changed or removed:
+            threading.Thread(target=push_abbr, args=(changed, removed), daemon=True).start()
+        self._abbr_loaded = dict(config["applicant_abbr"])
         # 저장한 그대로 다시 채운다 — 약칭을 비운 행은 빠지고 이름순으로 정리된다
         self.abbr_table.setRowCount(0)
         for name, abbr in sorted(config["applicant_abbr"].items()):
@@ -2235,4 +2323,8 @@ if __name__ == "__main__":
     # 기한 확인: 1분마다 시각을 보고, 켤 때 놓친 확인은 곧바로 따라잡는다
     deadline_runner = DeadlineRunner(mw.tray_icon, mw)
     qtc.QTimer.singleShot(5_000, deadline_runner.tick)
+    # 출원인 약칭: NAS 표가 기준 — 켤 때 맞추고 설정 창을 새로 채운다
+    abbr_sync = AbbrSync(mw)
+    abbr_sync.done.connect(mw.reload_abbr_table)
+    qtc.QTimer.singleShot(3_000, abbr_sync.start)
     sys.exit(app.exec())

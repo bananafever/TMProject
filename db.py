@@ -137,6 +137,32 @@ def insert_assignments(conn, rows: List[dict]) -> int:
     return insert_rows(conn, rows, ASSIGNMENTS)
 
 
+# ── 출원인 약칭 (`applicant_abbr` — 일정 제목 꼬리, 두 PC·ChekPat 이 함께) ──────────────────────
+
+def load_abbr(conn) -> Dict[str, str]:
+    """NAS 약칭 표 {국문 명칭: 약칭}. 표가 없으면 DbError."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name, abbr FROM applicant_abbr")
+            return {r["name"]: r["abbr"] for r in cur.fetchall() if r.get("name") and r.get("abbr")}
+    except Exception as e:
+        raise DbError(f"applicant_abbr 표를 읽지 못했습니다: {e}")
+
+
+def save_abbr(conn, rows: Dict[str, str], removed=()) -> Tuple[int, int]:
+    """약칭을 쓰고(있으면 고침) `removed` 명칭은 지운다. 커밋까지. 반환값: (쓴 줄, 지운 줄)."""
+    wrote = deleted = 0
+    with conn.cursor() as cur:
+        for name, abbr in rows.items():
+            cur.execute("INSERT INTO applicant_abbr (name, abbr) VALUES (%s, %s) ON DUPLICATE KEY UPDATE abbr = VALUES(abbr)",
+                        (name, abbr))
+            wrote += 1
+        for name in removed:
+            deleted += cur.execute("DELETE FROM applicant_abbr WHERE name = %s", (name,)) or 0
+    conn.commit()
+    return wrote, deleted
+
+
 def load_state(path: str) -> dict:
     """{"recorded": {EntryID: 쓴 날}, "pending": [못 쓴 줄]}."""
     try:

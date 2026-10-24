@@ -248,5 +248,80 @@ class TestRecordAssignmentsInFlow(unittest.TestCase):
         self.assertEqual(conn.rows["D"][db.ASSIGNMENT_COLUMNS.index("doc_type")], "특허결정서")
 
 
+
+class AbbrConn(FakeConn):
+    """약칭 표 가짜 — SELECT 는 self.table, INSERT … ON DUPLICATE·DELETE 는 self.table 을 고친다."""
+
+    def __init__(self, table=None):
+        super().__init__()
+        self.table = dict(table or {})
+
+    def cursor(self):
+        conn = self
+
+        class _Cur(FakeCursor):
+            def execute(self, sql, params=None):
+                conn.executed.append((sql, params))
+                if sql.startswith("SELECT name, abbr"):
+                    self._rows = [{"name": k, "abbr": v} for k, v in conn.table.items()]
+                elif sql.startswith("INSERT INTO applicant_abbr"):
+                    conn.table[params[0]] = params[1]
+                elif sql.startswith("DELETE FROM applicant_abbr"):
+                    return 1 if conn.table.pop(params[0], None) is not None else 0
+                return 1
+
+            def fetchall(self):
+                return getattr(self, "_rows", [])
+        return _Cur(self)
+
+
+class TestApplicantAbbr(unittest.TestCase):
+    """출원인 약칭 — NAS applicant_abbr 가 기준(10-24 사용자), settings.json 은 사본."""
+
+    def setUp(self):
+        patcher = patch.dict(main.config, {"applicant_abbr": {"가공 주식회사": "가공", "이피씨만": "이피"}})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(main, "save_config")
+        self.save_config = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_db_load_and_save(self):
+        conn = AbbrConn({"가공 주식회사": "가공"})
+        self.assertEqual(db.load_abbr(conn), {"가공 주식회사": "가공"})
+        self.assertEqual(db.save_abbr(conn, {"새 회사": "새"}, ["가공 주식회사", "없는 이름"]), (1, 1))
+        self.assertEqual(conn.table, {"새 회사": "새"})
+        self.assertEqual(conn.commits, 1)
+        self.assertIn("ON DUPLICATE KEY UPDATE", conn.executed[1][0])                # [0] 은 앞의 SELECT
+
+    def test_merge_nas_wins_and_uploads_local_only(self):
+        merged, upload = main.merge_abbr({"가공  주식회사": "가공", "이피씨만": "이피"}, {"가공 주식회사": "가공사", "엔에이에스": "나스"})
+        self.assertEqual(merged, {"가공 주식회사": "가공사", "이피씨만": "이피", "엔에이에스": "나스"})
+        self.assertEqual(upload, {"이피씨만": "이피"})
+
+    def test_sync_at_start(self):
+        conn = AbbrConn({"가공 주식회사": "가공사", "엔에이에스": "나스"})
+        got = main.sync_abbr(connect_fn=lambda: conn)
+        self.assertEqual(got, {"가공 주식회사": "가공사", "이피씨만": "이피", "엔에이에스": "나스"})
+        self.assertEqual(main.config["applicant_abbr"], got)
+        self.assertEqual(conn.table["이피씨만"], "이피")              # 이 PC 에만 있던 것은 NAS 로
+        self.save_config.assert_called_once()
+
+    def test_sync_without_nas_keeps_file(self):
+        self.assertIsNone(main.sync_abbr(connect_fn=lambda: (_ for _ in ()).throw(db.DbError("NAS 꺼짐"))))
+        self.assertEqual(main.config["applicant_abbr"], {"가공 주식회사": "가공", "이피씨만": "이피"})
+        self.save_config.assert_not_called()
+
+    def test_settings_save_pushes_changes_and_deletes(self):
+        loaded = {"가공 주식회사": "가공", "이피씨만": "이피"}
+        saved = {"가공 주식회사": "가공2", "새 회사": "새"}
+        changed, removed = main.abbr_changes(loaded, saved)
+        self.assertEqual((changed, removed), ({"가공 주식회사": "가공2", "새 회사": "새"}, ["이피씨만"]))
+        conn = AbbrConn(loaded)
+        self.assertTrue(main.push_abbr(changed, removed, connect_fn=lambda: conn))
+        self.assertEqual(conn.table, saved)
+        self.assertFalse(main.push_abbr(changed, removed, connect_fn=lambda: (_ for _ in ()).throw(db.DbError("x"))))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
