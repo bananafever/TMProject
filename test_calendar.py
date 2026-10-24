@@ -9,6 +9,7 @@
 
 import logging
 import os
+import shutil
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -382,6 +383,37 @@ class TestSenderFilter(unittest.TestCase):
         restrict.assert_called_once_with(main.build_sender_filter(main.DELEGATION_SENDERS))
         save_one.assert_called_once()
         self.assertIs(save_one.call_args[0][0], delegated)
+
+
+    def test_transferred_attachments_are_not_downloaded_again(self):
+        """File Transfer 로 02_Review 에 옮긴 검수 첨부는 메일이 받은편지함에 남아 있어도 다시 받지 않는다(10-24)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            parent, target = os.path.join(tmp, "Tasks"), os.path.join(tmp, "02_Review")
+            msg = MagicMock()
+            msg.Subject = "[위임] LA-26999; 김가공(팀); 검토 요청"
+            msg.CreationTime = datetime(2026, 8, 28, 13, 53)
+            msg.Attachments = [MagicMock(FileName="a.docx")]
+            with patch.dict(main.config, {"parent_path": parent, "target_path": target}):
+                os.makedirs(os.path.join(target, main.transfer_name("2026-08-28", "13hr53mn", "LA-26999", "김가공")))
+                got = []
+                main._save_attachments_for_message(msg, got)
+                self.assertEqual(got, [("2026-08-28 13:53", "LA-26999", "김가공", "Already Transferred")])
+                msg.Attachments[0].SaveAsFile.assert_not_called()
+                self.assertFalse(os.path.exists(parent))                 # 작업 폴더도 만들지 않는다
+                shutil.rmtree(target)
+                got = []
+                main._save_attachments_for_message(msg, got)              # 옮긴 자리가 없으면 예전처럼 받는다
+                self.assertEqual(got[0][3], "Downloaded")
+                msg.Attachments[0].SaveAsFile.assert_called_once()
+            with patch.dict(main.config, {"parent_path": parent, "target_path": ""}):
+                self.assertFalse(main.already_transferred("2026-08-28", "13hr53mn", "LA-26999", "김가공"))
+
+    def test_transfer_name_matches_task_folder(self):
+        """작업 폴더 이름(시각_Ref_이름)을 transfer_clicked 처럼 쪼개면 already_transferred 가 보는 자리와 같다."""
+        time_id, ref, name = "13hr53mn", "LA-26999", "김가공"
+        time_info, ref_info, person_info = (time_id + "_" + ref + "_" + name).split("_", 2)
+        self.assertEqual(main.transfer_name("2026-08-28", time_info, ref_info, person_info),
+                         os.path.join("LA-26999", "2026-08-28_13hr53mn_김가공"))
 
 
 PRENOTICE_BODY = (

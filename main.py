@@ -313,6 +313,19 @@ def _extract_message_info(message):
     return delivery_date, time_id, ref_num, name
 
 
+def transfer_name(date_folder, time_id, ref_num, name):
+    """File Transfer 가 검수 첨부를 옮겨 두는 자리(target_path 아래) — `<Ref>/<날짜>_<시각>_<이름>`.
+    작업 폴더 `parent_path/<날짜>/<시각>_<Ref>_<이름>` 의 짝이다."""
+    return os.path.join(ref_num, f"{date_folder}_{time_id}_{name}")
+
+
+def already_transferred(delivery_date, time_id, ref_num, name):
+    """이미 옮긴 검수 첨부인가 — 옮긴 뒤에도 메일이 받은편지함에 남아 있으면 켤 때마다 다시 내려받았다(10-24).
+    target_path 가 없거나 닿지 않으면 False(지금 동작 그대로)."""
+    target = config.get("target_path", "")
+    return bool(target) and os.path.isdir(os.path.join(target, transfer_name(delivery_date, time_id, ref_num, name)))
+
+
 def _save_attachments_for_message(message, attach_list=None):
     """단일 메시지의 첨부파일을 처리하고 저장합니다."""
     try:
@@ -321,13 +334,18 @@ def _save_attachments_for_message(message, attach_list=None):
         logging.error(f"메시지 정보 추출 실패: {e}")
         return
 
+    ref_folder = ref_num + "_" + name
+    time_str = f"{time_id[:2]}:{time_id[4:6]}"
+    if already_transferred(delivery_date, time_id, ref_num, name):
+        logging.info(ref_folder + ": Already Transferred")
+        if attach_list is not None:
+            attach_list.append((f"{delivery_date} {time_str}", ref_num, name, "Already Transferred"))
+        return
+
     date_folder = os.path.join(config["parent_path"], delivery_date)
     create_dir_if_not_exists(date_folder)
-
-    ref_folder = ref_num + "_" + name
     task_folder = os.path.join(date_folder, time_id + "_" + ref_folder)
 
-    time_str = f"{time_id[:2]}:{time_id[4:6]}"
     if create_dir_if_not_exists(task_folder):  # True = 이미 존재
         logging.info(ref_folder + ": Existing")
         if attach_list is not None:
@@ -1926,7 +1944,7 @@ class MainWin(qtw.QWidget):
 
                     try:
                         time_info, ref_info, person_info = case_folder.split("_", 2)
-                        target_folder_name = os.path.join(ref_info, f"{date_folder}_{time_info}_{person_info}")
+                        target_folder_name = transfer_name(date_folder, time_info, ref_info, person_info)
                         label_ref = ref_info
                         label_name = person_info
                     except ValueError:
