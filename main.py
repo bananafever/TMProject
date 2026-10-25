@@ -1664,8 +1664,14 @@ class MainWin(qtw.QWidget):
         self.load_history()
 
         # 3. Settings 탭 생성
-        self.tab_settings = qtw.QWidget()
-        settings_main_layout = qtw.QVBoxLayout(self.tab_settings)
+        # 다섯 칸이 창 높이에 눌려 글자·버튼이 잘리지 않게 — 칸마다 제 높이를 주고 창보다 길면 스크롤
+        self.tab_settings = qtw.QScrollArea()
+        self.tab_settings.setWidgetResizable(True)
+        self.tab_settings.setFrameShape(qtw.QFrame.NoFrame)
+        self.tab_settings.setHorizontalScrollBarPolicy(qtc.Qt.ScrollBarAlwaysOff)
+        settings_page = qtw.QWidget()
+        self.tab_settings.setWidget(settings_page)
+        settings_main_layout = qtw.QVBoxLayout(settings_page)
         settings_main_layout.setContentsMargins(18, 18, 18, 18)
         settings_main_layout.setSpacing(12)
         # 「설정 저장」 버튼은 창 맨 아래 Quit 줄에 있다 (Settings 탭에서만 보임)
@@ -1821,6 +1827,7 @@ class MainWin(qtw.QWidget):
         header.setDefaultAlignment(qtc.Qt.AlignLeft | qtc.Qt.AlignVCenter)
         self.abbr_table.verticalHeader().setVisible(False)
         self.abbr_table.verticalHeader().setDefaultSectionSize(32)
+        self.abbr_table.setMinimumHeight(200)  # 머리글 + 약 5행 — 창이 짧아도 머리글만 남지 않게
         self.abbr_table.setShowGrid(False)
         self.abbr_table.setAlternatingRowColors(True)
         self.abbr_table.setSelectionBehavior(qtw.QAbstractItemView.SelectRows)
