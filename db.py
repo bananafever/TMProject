@@ -1,4 +1,4 @@
-"""NAS MariaDB `iplog` — 받은 위임(`assignments`)·받은 지시(`instructions`)를 쓰고, 차수(`projects`)를 읽고 고친다.
+"""NAS MariaDB `iplog` — 받은 위임(`assignments`)·받은 지시(`instructions`)를 쓰고, 차수(`rounds`)를 읽고 고친다.
 Qt·Outlook 을 모른다.
 
 - 접속 정보: ChekPat 의 %APPDATA%\\ChekPat\\credentials.dat (DPAPI 봉인 JSON — `DB_HOST`·`DB_PORT`(비면 3307)·
@@ -89,7 +89,7 @@ def test_connection() -> str:
     conn = connect(force=True)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n, SUM(project_id IS NULL) AS waiting FROM assignments")
+            cur.execute("SELECT COUNT(*) AS n, SUM(round_id IS NULL) AS waiting FROM assignments")
             row = cur.fetchone() or {}
     except Exception as e:
         raise DbError(f"assignments 표를 읽지 못했습니다: {e}")

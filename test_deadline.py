@@ -148,7 +148,7 @@ class TestCheckExtensions(unittest.TestCase):
         mover = MagicMock(return_value="일정 옮김")
         docs = [_doc("2024-11-18", status="수리"), _doc("2026-10-23")]
         alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: docs, mover=mover, drift=False)
-        self.assertEqual(conn.updates(), [("UPDATE projects SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
+        self.assertEqual(conn.updates(), [("UPDATE rounds SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
                                            ("2026-12-23", 7))])
         row, olds, new = mover.call_args.args
         self.assertEqual((row["id"], olds, new), (7, [date(2026, 11, 23), date(2026, 11, 23)], date(2026, 12, 23)))
@@ -165,7 +165,7 @@ class TestCheckExtensions(unittest.TestCase):
         mover = MagicMock()
         docs = [_doc("2026-10-20"), _doc("2026-10-23", name="법정기간연장승인서", status="발송처리완료")]
         alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: docs, mover=mover, drift=False)
-        self.assertEqual(conn.updates(), [("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (7,))])
+        self.assertEqual(conn.updates(), [("UPDATE rounds SET ext_status = 'unconfirmed' WHERE id = %s", (7,))])
         mover.assert_not_called()
         self.assertEqual(alerts[0].title, "기연신청서 제출 확인 안 됨 1건")
         self.assertIn("2026-10-23 이후 낸 기간연장신청서가 KIPRIS 에 없음", alerts[0].lines[0])
@@ -188,7 +188,7 @@ class TestCheckExtensions(unittest.TestCase):
         mover = MagicMock()
         alerts = dw.check_extensions(conn, self.DAY, fetch_docs=lambda app: [_doc("2026-10-23")], mover=mover,
                                      drift=False)
-        self.assertEqual(conn.updates(), [("UPDATE projects SET ext_status = 'confirmed' WHERE id = %s", (7,))])
+        self.assertEqual(conn.updates(), [("UPDATE rounds SET ext_status = 'confirmed' WHERE id = %s", (7,))])
         mover.assert_not_called()
         self.assertIn("연장 월수를 몰라", alerts[0].lines[0])
 
@@ -234,8 +234,8 @@ class TestCheckExtensions(unittest.TestCase):
                                      mover=MagicMock(return_value="옮김"))
         self.assertEqual(calls, ["10-2024-0000001", "10-2024-0000002", "10-2024-0000003"])
         ups = conn.updates()
-        self.assertEqual(ups[0], ("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (7,)))
-        self.assertEqual(ups[1], ("UPDATE projects SET due_extended = %s, ext_status = %s WHERE id = %s",
+        self.assertEqual(ups[0], ("UPDATE rounds SET ext_status = 'unconfirmed' WHERE id = %s", (7,)))
+        self.assertEqual(ups[1], ("UPDATE rounds SET due_extended = %s, ext_status = %s WHERE id = %s",
                                   ("2026-11-30", None, 8)))
         self.assertEqual(ups[2][1], ("2026-11-30", "confirmed", 9))
         self.assertEqual(len(ups), 3)

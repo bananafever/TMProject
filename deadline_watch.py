@@ -163,7 +163,7 @@ def round_due(notices: List[kipris.Notice], stage: str) -> Optional[date]:
 def check_deadlines(conn, day: date, today: Optional[date] = None) -> List[Alert]:
     """그날이 대응기한인데 제출도 기연(확인)도 없는 진행 중 차수. 기연을 의뢰했으나 확인 안 된(unconfirmed) 차수도 알린다."""
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {_ROUND_COLS} FROM projects p JOIN refs r ON r.id = p.ref_id"
+        cur.execute(f"SELECT {_ROUND_COLS} FROM rounds p JOIN cases r ON r.id = p.case_id"
                     f" WHERE COALESCE(p.due_extended, p.due_date) = %s AND {_OPEN}"
                     " AND (p.ext_status IS NULL OR p.ext_status IN ('', 'unconfirmed')) ORDER BY r.ref, p.round_n",
                     (day.isoformat(),))
@@ -243,7 +243,7 @@ def check_extensions(conn, day: date, fetch_docs=kipris.fetch_documents, fetch_d
     docs, kip = _KiprisCache(fetch_docs), _KiprisCache(fetch_due)
     confirmed, unconfirmed, failed, drifted, corrected = [], [], [], [], []
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {_ROUND_COLS} FROM projects p JOIN refs r ON r.id = p.ref_id"
+        cur.execute(f"SELECT {_ROUND_COLS} FROM rounds p JOIN cases r ON r.id = p.case_id"
                     " WHERE p.ext_status IN ('requested', 'unconfirmed') AND DATE(p.ext_requested_at) BETWEEN %s AND %s"
                     " ORDER BY r.ref, p.round_n",
                     ((day - timedelta(days=EXT_LOOKBACK_DAYS)).isoformat(), day.isoformat()))
@@ -259,19 +259,19 @@ def check_extensions(conn, day: date, fetch_docs=kipris.fetch_documents, fetch_d
                 continue
             if not filed:
                 if row.get("ext_status") != "unconfirmed":
-                    cur.execute("UPDATE projects SET ext_status = 'unconfirmed' WHERE id = %s", (row["id"],))
+                    cur.execute("UPDATE rounds SET ext_status = 'unconfirmed' WHERE id = %s", (row["id"],))
                 logging.warning(f"기연신청서 제출 확인 안 됨: {label} — {since} 이후 접수된 기간연장신청서 없음")
                 unconfirmed.append(f"{label} — {since} 이후 낸 기간연장신청서가 KIPRIS 에 없음")
                 continue
             months = row.get("ext_months")
             new = current + relativedelta(months=int(months)) if current and months else None
             if new:
-                cur.execute("UPDATE projects SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
+                cur.execute("UPDATE rounds SET due_extended = %s, ext_status = 'confirmed' WHERE id = %s",
                             (new.isoformat(), row["id"]))
                 moved = _move(mover, row, [current, as_date(row.get("due_date"))], new) if mover else ""
                 change = f"{current} → {new}" + (f" · {moved}" if moved else "")
             else:
-                cur.execute("UPDATE projects SET ext_status = 'confirmed' WHERE id = %s", (row["id"],))
+                cur.execute("UPDATE rounds SET ext_status = 'confirmed' WHERE id = %s", (row["id"],))
                 change = "연장 월수를 몰라 대응기한·일정은 그대로 — KIPRIS 기한이 늘면 고칩니다"
             text = f"기연신청서 {filed.receipt_date} {filed.status} · {change}"
             logging.info(f"기연신청서 제출 확인: {label} — {text}")
@@ -279,7 +279,7 @@ def check_extensions(conn, day: date, fetch_docs=kipris.fetch_documents, fetch_d
 
         if drift:
             done = {r["id"] for r in requested}
-            cur.execute(f"SELECT {_ROUND_COLS} FROM projects p JOIN refs r ON r.id = p.ref_id"
+            cur.execute(f"SELECT {_ROUND_COLS} FROM rounds p JOIN cases r ON r.id = p.case_id"
                         f" WHERE {_OPEN} AND (p.ext_status IS NULL OR p.ext_status <> 'requested')"
                         " AND COALESCE(p.due_extended, p.due_date) BETWEEN %s AND %s"
                         " AND r.app_no IS NOT NULL AND r.app_no <> '' ORDER BY r.ref, p.round_n",
@@ -299,7 +299,7 @@ def check_extensions(conn, day: date, fetch_docs=kipris.fetch_documents, fetch_d
                 if not (current and new and new != current and new > floor):
                     continue
                 status = "confirmed" if row.get("ext_status") == "unconfirmed" else row.get("ext_status")
-                cur.execute("UPDATE projects SET due_extended = %s, ext_status = %s WHERE id = %s",
+                cur.execute("UPDATE rounds SET due_extended = %s, ext_status = %s WHERE id = %s",
                             (new.isoformat(), status or None, row["id"]))
                 moved = _move(mover, row, [current, as_date(row.get("due_date"))], new) if mover else ""
                 line = f"{label}: {current} → {new}" + (f" · {moved}" if moved else "")
