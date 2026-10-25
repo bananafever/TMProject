@@ -137,15 +137,6 @@ NAV_ICONS = {
         <circle cx="13" cy="10" r="1.8" fill="{color}"/>
         <circle cx="9" cy="14" r="1.8" fill="{color}"/>
         </svg>""",
-    "eye": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
-        <path d="M2.5 10 C4.5 6 7 4.5 10 4.5 C13 4.5 15.5 6 17.5 10 C15.5 14 13 15.5 10 15.5 C7 15.5 4.5 14 2.5 10 Z" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>
-        <circle cx="10" cy="10" r="2.5" fill="none" stroke="{color}" stroke-width="1.5"/>
-        </svg>""",
-    "eye_off": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
-        <path d="M2.5 10 C4.5 6 7 4.5 10 4.5 C13 4.5 15.5 6 17.5 10 C15.5 14 13 15.5 10 15.5 C7 15.5 4.5 14 2.5 10 Z" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>
-        <circle cx="10" cy="10" r="2.5" fill="none" stroke="{color}" stroke-width="1.5"/>
-        <path d="M3.5 3.5 L16.5 16.5" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>""",
 }
 
 
@@ -1375,6 +1366,52 @@ class StartupSummaryDialog(qtw.QDialog):
         layout.addLayout(btn_box)
 
 
+class FieldsDialog(qtw.QDialog):
+    """설정 탭 「편집」 창 — 값 몇 개를 넓은 칸에 보여 주고 고친다. 「확인」 은 화면에만, 저장은 「설정 저장」 으로."""
+
+    def __init__(self, parent, title, fields, note="", mono=False):
+        """fields: [(이름표, 값, 예시 글자), ...]"""
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        layout = qtw.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(10)
+        form = qtw.QFormLayout()
+        form.setSpacing(8)
+        self.edits = []
+        for label, value, placeholder in fields:
+            edit = qtw.QLineEdit(value)
+            edit.setPlaceholderText(placeholder)
+            if mono:
+                edit.setObjectName("monoEdit")   # 스타일시트 글꼴이 setFont 를 덮으므로 스타일시트로
+            if label:
+                form.addRow(label, edit)
+            else:
+                form.addRow(edit)
+            self.edits.append(edit)
+        layout.addLayout(form)
+        if note:
+            hint = qtw.QLabel(note)
+            hint.setObjectName("settingsHint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        btn_box = qtw.QHBoxLayout()
+        btn_box.addStretch()
+        ok_btn = qtw.QPushButton("확인")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = qtw.QPushButton("취소")
+        cancel_btn.setObjectName("quitButton")
+        cancel_btn.clicked.connect(self.reject)
+        btn_box.addWidget(ok_btn)
+        btn_box.addWidget(cancel_btn)
+        layout.addLayout(btn_box)
+
+    def values(self):
+        return [edit.text().strip() for edit in self.edits]
+
+
 def catch_up_calendar(outlook):
     """시작할 때: 실패했던 일정을 다시 등록하고, 놓친 위임 메일의 일정을 등록한 뒤 결과를 요약해 보여 줍니다."""
     rows = []
@@ -1777,18 +1814,18 @@ class MainWin(qtw.QWidget):
 
         # 3-2. 일정 등록 — 위임 메일 담당자 (파일 경로 칸 오른쪽)
         cal_frame, cal_box = section("일정 등록")
-        cal_box.addWidget(qtw.QLabel("위임 메일 담당자"))
-        self.assignees_edit = qtw.QLineEdit(", ".join(calendar_assignees()))
-        self.assignees_edit.setPlaceholderText("홍길동, 김철수")
-        # 이름은 평소 ●●● 로 가리고 칸 오른쪽 눈 버튼으로 보인다 (Settings 탭을 떠나면 다시 가린다)
-        self.assignees_eye = self.assignees_edit.addAction(make_icon("eye", "#8A877E", 18),
-                                                           qtw.QLineEdit.TrailingPosition)
-        self.assignees_eye.setCheckable(True)
-        self.assignees_eye.toggled.connect(self._show_assignees)
-        self._show_assignees(False)
-        cal_box.addWidget(self.assignees_edit)
-        cal_box.addWidget(hint("쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다. "
-                               "눈 버튼을 눌러 이름을 보이게 한 뒤 고칩니다."))
+        # 이름은 화면에 두지 않고 사람 수만 — 「편집」 창에서 보고 고친다
+        self.assignees = calendar_assignees()
+        assignees_row = qtw.QHBoxLayout()
+        self.assignees_label = qtw.QLabel()
+        assignees_btn = qtw.QPushButton("편집")
+        assignees_btn.setObjectName("secondaryButton")
+        assignees_btn.clicked.connect(self.edit_assignees_clicked)
+        assignees_row.addWidget(self.assignees_label, 1)
+        assignees_row.addWidget(assignees_btn)
+        cal_box.addLayout(assignees_row)
+        self._show_assignees_count()
+        cal_box.addWidget(hint("이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다."))
         cal_box.addStretch()
 
         top_row = qtw.QHBoxLayout()
@@ -1840,14 +1877,21 @@ class MainWin(qtw.QWidget):
         self.mail_backend_combo.addItem("새 Outlook (Microsoft Graph)", "graph")
         self.mail_backend_combo.setCurrentIndex(max(0, self.mail_backend_combo.findData(config.get("mail_backend"))))
         mail_row.addWidget(self.mail_backend_combo)
-        mail_row.addWidget(qtw.QLabel("Client ID"))
-        self.graph_client_edit = qtw.QLineEdit(config.get("graph_client_id", ""))
-        mail_row.addWidget(self.graph_client_edit, 1)
-        mail_row.addWidget(qtw.QLabel("Tenant ID"))
-        self.graph_tenant_edit = qtw.QLineEdit(config.get("graph_tenant_id", ""))
-        mail_row.addWidget(self.graph_tenant_edit, 1)
+        # Client ID·Tenant ID 는 「앱 ID 편집」 창에서만 — 비었을 때만 알린다
+        self.graph_ids = [config.get("graph_client_id", ""), config.get("graph_tenant_id", "")]
+        self.graph_ids_missing = qtw.QLabel("Client ID·Tenant ID 를 넣어야 합니다")
+        self.graph_ids_missing.setStyleSheet("color: #8A5300;")
+        self.graph_ids_btn = qtw.QPushButton("앱 ID 편집")
+        self.graph_ids_btn.setObjectName("secondaryButton")
+        self.graph_ids_btn.clicked.connect(self.edit_graph_ids_clicked)
+        mail_row.addWidget(self.graph_ids_missing)
+        mail_row.addStretch()
+        mail_row.addWidget(self.graph_ids_btn)
         mail_box.addLayout(mail_row)
-        login_row = qtw.QHBoxLayout()
+        self.graph_login_row = qtw.QWidget()   # 클래식 Outlook 이면 숨긴다
+        self.graph_login_row.setObjectName("graphLoginRow")
+        login_row = qtw.QHBoxLayout(self.graph_login_row)
+        login_row.setContentsMargins(0, 0, 0, 0)
         login_row.setSpacing(10)
         self.graph_status = qtw.QLabel("로그인을 확인하지 않았습니다")
         self.graph_status.setObjectName("settingsHint")
@@ -1856,11 +1900,13 @@ class MainWin(qtw.QWidget):
         self.graph_login_btn.clicked.connect(self.graph_login_clicked)
         login_row.addWidget(self.graph_status, 1)
         login_row.addWidget(self.graph_login_btn)
-        mail_box.addLayout(login_row)
+        mail_box.addWidget(self.graph_login_row)
         mail_box.addWidget(hint("새 Outlook 은 COM 을 지원하지 않아 Microsoft Graph 로 받은편지함을 읽습니다(읽기만). "
-                                "Client ID·Tenant ID 는 Entra 「TaskManager」 앱의 값. 읽는 곳을 바꾸면 앱을 다시 켜야 합니다."))
+                                "읽는 곳을 바꾸면 앱을 다시 켜야 합니다."))
         self.graph_login = GraphLogin(self)
         self.graph_login.done.connect(self._graph_login_done)
+        self.mail_backend_combo.currentIndexChanged.connect(self._show_graph_rows)
+        self._show_graph_rows()
         settings_main_layout.addWidget(mail_frame)
 
         # 3-5. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
@@ -2098,8 +2144,9 @@ class MainWin(qtw.QWidget):
     def save_settings_ui(self):
         config["parent_path"] = self.parent_path_edit.text()
         config["target_path"] = self.target_path_edit.text()
-        config["calendar_assignees"] = parse_names(self.assignees_edit.text()) or DEFAULT_CONFIG["calendar_assignees"]
-        self.assignees_edit.setText(", ".join(config["calendar_assignees"]))
+        config["calendar_assignees"] = self.assignees or DEFAULT_CONFIG["calendar_assignees"]
+        self.assignees = list(config["calendar_assignees"])
+        self._show_assignees_count()
         config["applicant_abbr"] = self._abbr_rows()
         # NAS 약칭 표에도 — 처음 채운(또는 마지막으로 맞춘) 표와 견줘 고친·지운 명칭만, 뒤 스레드로
         changed, removed = abbr_changes(self._abbr_loaded, config["applicant_abbr"])
@@ -2116,8 +2163,7 @@ class MainWin(qtw.QWidget):
         backend = self.mail_backend_combo.currentData()
         restart = backend != config.get("mail_backend", "outlook")
         config["mail_backend"] = backend
-        config["graph_client_id"] = self.graph_client_edit.text().strip()
-        config["graph_tenant_id"] = self.graph_tenant_edit.text().strip()
+        config["graph_client_id"], config["graph_tenant_id"] = self.graph_ids
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
                      f"담당자 {len(config['calendar_assignees'])}명, 약칭 {len(config['applicant_abbr'])}개, "
@@ -2131,7 +2177,7 @@ class MainWin(qtw.QWidget):
         self.graph_login_btn.setEnabled(False)
         self.graph_status.setText("브라우저에서 로그인하세요…")
         self.graph_status.setStyleSheet("")
-        self.graph_login.start(self.graph_client_edit.text().strip(), self.graph_tenant_edit.text().strip())
+        self.graph_login.start(*self.graph_ids)
 
     def _graph_login_done(self, ok, text):
         self.graph_login_btn.setEnabled(True)
@@ -2226,14 +2272,32 @@ class MainWin(qtw.QWidget):
         self.save_btn.setVisible(on_settings)
         if on_settings:
             self._fit_abbr_column()
-        else:
-            self.assignees_eye.setChecked(False)
 
-    def _show_assignees(self, shown):
-        """위임 메일 담당자 이름 — 눈 버튼으로 보이기/가리기. 가린 동안은 한글 입력이 안 되므로 보인 뒤 고친다."""
-        self.assignees_edit.setEchoMode(qtw.QLineEdit.Normal if shown else qtw.QLineEdit.Password)
-        self.assignees_eye.setIcon(make_icon("eye_off" if shown else "eye", "#8A877E", 18))
-        self.assignees_eye.setToolTip("이름 가리기" if shown else "이름 보기")
+    def _show_assignees_count(self):
+        self.assignees_label.setText(f"위임 메일 담당자 <b>{len(self.assignees)}명</b>")
+
+    def edit_assignees_clicked(self):
+        dialog = FieldsDialog(self, "위임 메일 담당자", [("", ", ".join(self.assignees), "홍길동, 김철수")],
+                              "쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다. "
+                              "「설정 저장」 을 눌러야 저장됩니다.")
+        if dialog.exec():
+            self.assignees = parse_names(dialog.values()[0])
+            self._show_assignees_count()
+
+    def _show_graph_rows(self):
+        """Graph 일 때만 「앱 ID 편집」·로그인 줄 — ID 가 비었으면 알림도."""
+        graph = self.mail_backend_combo.currentData() == "graph"
+        self.graph_ids_btn.setVisible(graph)
+        self.graph_login_row.setVisible(graph)
+        self.graph_ids_missing.setVisible(graph and not all(self.graph_ids))
+
+    def edit_graph_ids_clicked(self):
+        dialog = FieldsDialog(self, "Microsoft Graph 앱",
+                              [("Client ID", self.graph_ids[0], ""), ("Tenant ID", self.graph_ids[1], "")],
+                              "Entra 「TaskManager」 앱의 값. 「설정 저장」 을 눌러야 저장됩니다.", mono=True)
+        if dialog.exec():
+            self.graph_ids = dialog.values()
+            self._show_graph_rows()
 
     def _equalize_bottom_buttons(self):
         """「설정 저장」 과 Quit 을 같은 폭·높이로 — 둘 중 큰 쪽에 맞춘다."""
@@ -2532,6 +2596,12 @@ if __name__ == "__main__":
         QScrollArea, #cardsContainer {
             background-color: transparent;
             border: none;
+        }
+        #graphLoginRow {
+            background-color: transparent;
+        }
+        QLineEdit#monoEdit {
+            font-family: 'Consolas', monospace;
         }
         #historyText {
             border-radius: 12px;
