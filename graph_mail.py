@@ -13,6 +13,7 @@ settings.json `mail_backend: "graph"` 일 때 main 이 클래식 Outlook COM 대
 """
 
 import base64
+import concurrent.futures
 import email
 import email.policy
 import email.utils
@@ -38,6 +39,9 @@ LIST_FIELDS = "id,subject,from,receivedDateTime,createdDateTime,hasAttachments,p
 NEW_MAIL_SLACK = timedelta(minutes=5)                   # 받은 시각이 서버마다 조금 늦게 잡혀도 놓치지 않게 겹쳐 본다
 # 새 메일 감시에서 뺄 폴더 — 클래식 OnNewMailEx 처럼 「받은」 메일만(규칙이 다른 폴더로 옮긴 것은 본다)
 NOT_RECEIVED_FOLDERS = ("sentitems", "drafts", "outbox", "deleteditems")
+SEARCH_FIELDS = LIST_FIELDS + ",toRecipients,bodyPreview"
+SEARCH_LIMIT = 500                                      # Search 탭이 한 번에 보일 수 — 넘으면 「N통 이상」
+SEARCH_WORKERS = 4                                      # 하위 폴더 검색을 동시에 몇 개
 OL_EMBEDDED_ITEM = 5                                    # instruction_mail 과 같은 COM 값 — 항목으로 붙은 메일
 _PROP = "http://schemas.microsoft.com/mapi/proptag/"
 PR_ATTACH_CONTENT_ID = _PROP + "0x3712001F"
@@ -282,6 +286,8 @@ class GraphAttachment:
         self.FileName = data.get("name") or "attachment"
         self.is_item = data.get("@odata.type") == "#microsoft.graph.itemAttachment"
         self.Type = OL_EMBEDDED_ITEM if self.is_item else 1
+        self.Size = data.get("size") or 0
+        self.is_inline = bool(data.get("isInline"))
         self.PropertyAccessor = _Accessor({PR_ATTACH_CONTENT_ID: data.get("contentId") or "",
                                            PR_ATTACHMENT_HIDDEN: False})
 
@@ -313,6 +319,9 @@ class GraphMessage:
         self.CreationTime = local_time(data.get("createdDateTime")) or self.ReceivedTime
         self.EntryID = entry_id
         self.parent_folder_id = data.get("parentFolderId", "")
+        self.To = "; ".join(((r.get("emailAddress") or {}).get("name") or (r.get("emailAddress") or {}).get("address") or "")
+                            for r in data.get("toRecipients") or [])
+        self.Preview = data.get("bodyPreview") or ""
         self._body, self._attachments = data.get("body"), None
 
     def _load_body(self):
@@ -337,6 +346,13 @@ class GraphMessage:
                 items = list(self._client.pages(f"/me/messages/{self.id}/attachments"))
             self._attachments = GraphAttachments(GraphAttachment(self._client, self.id, a) for a in items)
         return self._attachments
+
+    def attachment_list(self) -> GraphAttachments:
+        """Search 탭 미리보기용 — 이름·크기만 받는다(내용은 저장할 때 `$value` 로). 본문에 박힌 그림은 뺀다."""
+        if not self.data.get("hasAttachments"):
+            return GraphAttachments()
+        rows = self._client.pages(f"/me/messages/{self.id}/attachments?$select=id,name,size,isInline,contentType")
+        return GraphAttachments(a for a in (GraphAttachment(self._client, self.id, r) for r in rows) if not a.is_inline)
 
     def SaveAs(self, path, *_ignored):
         """메일 원본(MIME)을 `.eml` 로 — ChekPat 은 .eml 을 읽는다."""
@@ -369,6 +385,33 @@ def _matches(message: GraphMessage, senders, subject_like) -> bool:
     return not subject_like or subject_like in message.Subject
 
 
+def _kql_value(value: str) -> str:
+    value = value.strip().replace('"', "")
+    return f'"{value}"' if re.search(r"\s", value) else value
+
+
+def kql(text="", sender="", since=None, has_attachments=False) -> str:
+    """Search 탭 입력 → KQL. 검색어는 그대로(사용자가 from:·subject: 를 직접 써도 된다), 조건은 뒤에 붙인다."""
+    parts = [text.strip()] if text and text.strip() else []
+    if sender and sender.strip():
+        parts.append("from:" + _kql_value(sender))
+    if has_attachments:
+        parts.append("hasAttachments:true")
+    if since is not None:
+        parts.append("received>=" + since.strftime("%Y-%m-%d"))
+    return " ".join(parts)
+
+
+def search_param(query: str) -> str:
+    """`$search` 값 — 통째로 큰따옴표에 넣고 안의 \\·" 는 \\ 로 막는다."""
+    return '"' + query.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class SearchResult(list):
+    """찾은 메일(받은 시각 새 것부터). truncated — limit 에 걸려 더 있다."""
+    truncated = False
+
+
 class GraphMailbox:
     """main 이 클래식 Outlook 네임스페이스 대신 받는 메일함. 시작 스캔은 받은편지함, 새 메일 감시는 모든 받은 폴더."""
 
@@ -380,6 +423,7 @@ class GraphMailbox:
         self._skip = None
         self._since = None
         self._seen = set()
+        self._folders = None
 
     @property
     def inbox_id(self) -> str:
@@ -454,6 +498,74 @@ class GraphMailbox:
             self._since = max(self._since, received - NEW_MAIL_SLACK)
         rows.sort(key=lambda r: r["receivedDateTime"])
         return self._wrap(rows)
+
+    # ── Search 탭 ──
+
+    def folders(self, refresh=False) -> List[dict]:
+        """폴더 나무를 위에서부터 — {id, name, path("1st Storage Box / 00_Tasks"), parent_id, depth}. 한 번 받고 둔다."""
+        if self._folders is None or refresh:
+            out = []
+            fields = "$select=id,displayName,parentFolderId,childFolderCount&$top=250"
+
+            def walk(url, path, depth):
+                for row in self.client.pages(url):
+                    name = row.get("displayName") or ""
+                    full = f"{path} / {name}" if path else name
+                    out.append({"id": row["id"], "name": name, "path": full,
+                                "parent_id": row.get("parentFolderId", ""), "depth": depth})
+                    if row.get("childFolderCount"):
+                        walk(f"/me/mailFolders/{row['id']}/childFolders?{fields}", full, depth + 1)
+
+            walk(f"/me/mailFolders?{fields}", "", 0)
+            self._folders = out
+        return self._folders
+
+    def subtree(self, folder_id: str) -> List[str]:
+        """folder_id 와 그 아래 모든 폴더 id."""
+        children = {}
+        for f in self.folders():
+            children.setdefault(f["parent_id"], []).append(f["id"])
+        out, todo = [], [folder_id]
+        while todo:
+            fid = todo.pop()
+            out.append(fid)
+            todo.extend(children.get(fid, []))
+        return out
+
+    def folder_path(self, folder_id: str) -> str:
+        return next((f["path"] for f in self.folders() if f["id"] == folder_id), "")
+
+    def search(self, text="", folder_id=None, subfolders=True, since=None, has_attachments=False, sender="",
+               limit=SEARCH_LIMIT) -> SearchResult:
+        """Graph `$search`(KQL)로 찾는다 — folder_id 가 없으면 메일함 전체, 있으면 그 폴더(subfolders 면 아래 폴더까지).
+
+        Graph 는 폴더 검색에 하위 폴더를 넣지 않고, 메일함 전체 검색은 결과 수 상한이 있어 한 폴더의 메일이 잘릴 수 있다 —
+        그래서 하위 폴더는 폴더마다 따로 찾아 합친다. `$search` 는 `$filter`·`$orderby` 와 같이 못 써서 날짜는 KQL 로,
+        정렬은 받아 와서 한다."""
+        query = kql(text, sender, since, has_attachments)
+        if not query:
+            raise GraphError("검색어나 조건을 넣으세요.")
+        params = "?" + urllib.parse.urlencode({"$search": search_param(query), "$select": SEARCH_FIELDS, "$top": "100"})
+        if folder_id is None:
+            urls = ["/me/messages" + params]
+        else:
+            ids = self.subtree(folder_id) if subfolders else [folder_id]
+            urls = [f"/me/mailFolders/{fid}/messages" + params for fid in ids]
+
+        def fetch(url):
+            rows = []
+            for row in self.client.pages(url, headers={"ConsistencyLevel": "eventual"}):
+                rows.append(row)
+                if len(rows) > limit:
+                    break
+            return rows
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(SEARCH_WORKERS, len(urls))) as pool:
+            rows = list({row["id"]: row for got in pool.map(fetch, urls) for row in got}.values())
+        rows.sort(key=lambda r: r.get("receivedDateTime") or "", reverse=True)
+        result = SearchResult(GraphMessage(self.client, r) for r in rows[:limit])
+        result.truncated = len(rows) > limit
+        return result
 
     # instruction_mail.read_embedded 가 부르는 COM 이름
     def OpenSharedItem(self, path):

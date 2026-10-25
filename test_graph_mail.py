@@ -68,7 +68,7 @@ class FakeClient:
         return self.call("GET", url, **kw)
 
     def pages(self, url, headers=None):
-        self.calls.append(("PAGES", url, None))
+        self.calls.append(("PAGES", url, headers))
         pages = self.page_routes[url.split("?")[0]]
         if callable(pages):
             pages = pages()
@@ -257,6 +257,83 @@ class TestMailbox(unittest.TestCase):
                              auth_factory=lambda c, t: G.Auth(c, t, app=app))
         self.assertIsInstance(box, G.GraphMailbox)
         self.assertEqual(app.acquire_token_silent.call_args.args[0], ["Mail.Read", "User.Read"])
+
+
+class TestSearch(unittest.TestCase):
+    """Search 탭 — Graph `$search`(KQL), 폴더 나무, 하위 폴더까지 찾기."""
+
+    TREE = {
+        "/me/mailFolders": [{"value": [
+            {"id": "INBOX", "displayName": "받은 편지함", "parentFolderId": "ROOT", "childFolderCount": 0},
+            {"id": "BOX", "displayName": "1st Storage Box", "parentFolderId": "ROOT", "childFolderCount": 1}]}],
+        "/me/mailFolders/BOX/childFolders": [{"value": [
+            {"id": "TASKS", "displayName": "00_Tasks", "parentFolderId": "BOX", "childFolderCount": 1}]}],
+        "/me/mailFolders/TASKS/childFolders": [{"value": [
+            {"id": "NEW", "displayName": "(A)_NewTask", "parentFolderId": "TASKS", "childFolderCount": 0}]}],
+    }
+
+    def _box(self, **pages):
+        return G.GraphMailbox(FakeClient(page_routes={**self.TREE, **pages}))
+
+    def test_kql_joins_conditions(self):
+        self.assertEqual(G.kql("거절이유", sender="김 변리사", since=date(2025, 10, 1), has_attachments=True),
+                         '거절이유 from:"김 변리사" hasAttachments:true received>=2025-10-01')
+        self.assertEqual(G.kql("  ", sender="kim"), "from:kim")
+        self.assertEqual(G.kql(), "")
+
+    def test_search_param_escapes_quotes(self):
+        self.assertEqual(G.search_param('subject:"a b" c\\d'), '"subject:\\"a b\\" c\\\\d"')
+
+    def test_empty_search_is_an_error(self):
+        with self.assertRaises(G.GraphError):
+            self._box().search("")
+
+    def test_folder_tree_paths(self):
+        box = self._box()
+        self.assertEqual([(f["path"], f["depth"]) for f in box.folders()],
+                         [("받은 편지함", 0), ("1st Storage Box", 0), ("1st Storage Box / 00_Tasks", 1),
+                          ("1st Storage Box / 00_Tasks / (A)_NewTask", 2)])
+        self.assertEqual(sorted(box.subtree("BOX")), ["BOX", "NEW", "TASKS"])
+        self.assertEqual(box.folder_path("NEW"), "1st Storage Box / 00_Tasks / (A)_NewTask")
+        calls = len(box.client.calls)
+        box.folders()
+        self.assertEqual(len(box.client.calls), calls)                       # 한 번 받은 나무는 다시 안 받는다
+
+    def test_whole_mailbox_search_newest_first(self):
+        box = self._box(**{"/me/messages": [{"value": [
+            _row("OLD", "거절이유 a", "김", "2099-01-01T00:00:00Z"),
+            _row("NEW", "거절이유 b", "김", "2099-03-01T00:00:00Z",
+                 toRecipients=[{"emailAddress": {"name": "나", "address": "me@x"}}], bodyPreview="안녕하세요")]}]})
+        got = box.search("거절이유")
+        self.assertEqual([m.id for m in got], ["NEW", "OLD"])
+        self.assertFalse(got.truncated)
+        self.assertEqual((got[0].To, got[0].Preview, got[0].EntryID), ("나", "안녕하세요", ""))   # 검색은 EntryID 를 안 바꾼다
+        method, url, headers = box.client.calls[-1]
+        self.assertTrue(url.startswith("/me/messages?"))
+        self.assertIn("%24search=%22%EA%B1%B0", url)
+        self.assertEqual(headers, {"ConsistencyLevel": "eventual"})
+        self.assertFalse([c for c in box.client.calls if c[1] == "/me/translateExchangeIds"])
+
+    def test_folder_search_with_and_without_subfolders(self):
+        pages = {"/me/mailFolders/TASKS/messages": [{"value": [_row("T", "x", "a", "2099-02-01T00:00:00Z")]}],
+                 "/me/mailFolders/NEW/messages": [{"value": [_row("N", "x", "a", "2099-02-02T00:00:00Z")]}]}
+        box = self._box(**pages)
+        self.assertEqual([m.id for m in box.search("x", folder_id="TASKS")], ["N", "T"])
+        self.assertEqual([m.id for m in box.search("x", folder_id="TASKS", subfolders=False)], ["T"])
+
+    def test_limit_marks_truncated(self):
+        rows = [_row(f"M{i}", "x", "a", f"2099-01-{i + 1:02d}T00:00:00Z") for i in reversed(range(5))]   # Graph 는 새 것부터 준다
+        got = self._box(**{"/me/messages": [{"value": rows}]}).search("x", limit=3)
+        self.assertEqual([m.id for m in got], ["M4", "M3", "M2"])
+        self.assertTrue(got.truncated)
+
+    def test_attachment_list_skips_inline(self):
+        client = FakeClient(page_routes={"/me/messages/A/attachments": [{"value": [
+            {"id": "1", "name": "통지서.pdf", "size": 1000, "isInline": False},
+            {"id": "2", "name": "image001.png", "size": 10, "isInline": True}]}]})
+        message = G.GraphMessage(client, _row("A", "s", "x", hasAttachments=True))
+        self.assertEqual([(a.FileName, a.Size) for a in message.attachment_list()], [("통지서.pdf", 1000)])
+        self.assertEqual(G.GraphMessage(client, _row("B", "s", "x")).attachment_list(), [])
 
 
 class TestMessage(unittest.TestCase):

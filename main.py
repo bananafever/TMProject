@@ -21,6 +21,7 @@ import deadline_watch
 import graph_mail
 import instruction_mail
 import kipris
+import mail_search_page
 import naver_cal
 
 # ── 데이터 폴더 ─────────────────────────────────────────────────────
@@ -130,6 +131,10 @@ NAV_ICONS = {
     "history": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
         <circle cx="10" cy="10" r="7" fill="none" stroke="{color}" stroke-width="1.6"/>
         <path d="M10 6 V10 L13 12" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>""",
+    "search": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="{color}" stroke-width="1.6"/>
+        <path d="M12.6 12.6 L17 17" stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>
         </svg>""",
     "settings": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
         <path d="M3 6 H17 M3 10 H17 M3 14 H17" stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>
@@ -1643,6 +1648,20 @@ def graph_login_status(client_id=None, tenant_id=None):
     return "로그인이 필요합니다 — 「Microsoft 로그인」 을 누르세요", False
 
 
+_search_mailbox = None
+_search_mailbox_lock = threading.Lock()
+
+
+def search_mailbox():
+    """Search 탭이 쓰는 Graph 메일함 — 저장된 Microsoft 로그인으로 따로 연다(새 메일 감시와 상태를 나누지 않게).
+    클래식 Outlook 으로 읽는 중이어도 로그인만 있으면 된다. 못 열면 LoginRequired·GraphError — 다음에 다시 해 본다."""
+    global _search_mailbox
+    with _search_mailbox_lock:
+        if _search_mailbox is None:
+            _search_mailbox = graph_mail.open_mailbox(config)
+        return _search_mailbox
+
+
 class GraphLogin(qtc.QObject):
     """설정 창 「Microsoft 로그인」 — 브라우저 로그인을 스레드에서 기다린다. 끝나면 done(성공, 글)."""
 
@@ -1770,7 +1789,10 @@ class MainWin(qtw.QWidget):
             self.add_table_row(*attach)
         self._update_tip()
 
-        # 2. History 탭 생성
+        # 2. Search 탭 — Graph 로 메일 찾기(mail_search_page)
+        self.tab_search = mail_search_page.MailSearchPage(search_mailbox)
+
+        # 3. History 탭 생성
         self.tab_history = qtw.QWidget()
         history_layout = qtw.QVBoxLayout(self.tab_history)
         history_layout.setContentsMargins(18, 18, 18, 18)
@@ -1793,7 +1815,7 @@ class MainWin(qtw.QWidget):
 
         self.load_history()
 
-        # 3. Settings 탭 생성
+        # 4. Settings 탭 생성
         # 다섯 칸이 창 높이에 눌려 글자·버튼이 잘리지 않게 — 칸마다 제 높이를 주고 창보다 길면 스크롤
         self.tab_settings = qtw.QScrollArea()
         self.tab_settings.setWidgetResizable(True)
@@ -1824,7 +1846,7 @@ class MainWin(qtw.QWidget):
             label.setWordWrap(True)
             return label
 
-        # 3-1. 파일 경로
+        # 4-1. 파일 경로
         path_frame, path_box = section("파일 경로")
         settings_layout = qtw.QFormLayout()
 
@@ -1847,7 +1869,7 @@ class MainWin(qtw.QWidget):
 
         path_box.addLayout(settings_layout)
 
-        # 3-2. 일정 등록 — 위임 메일 담당자 (파일 경로 칸 오른쪽)
+        # 4-2. 일정 등록 — 위임 메일 담당자 (파일 경로 칸 오른쪽)
         cal_frame, cal_box = section("일정 등록")
         # 이름은 화면에 두지 않고 사람 수만 — 「편집」 창에서 보고 고친다
         self.assignees = calendar_assignees()
@@ -1869,7 +1891,7 @@ class MainWin(qtw.QWidget):
         top_row.addWidget(cal_frame, 2)
         settings_main_layout.addLayout(top_row)
 
-        # 3-3. 기한 확인 — NAS DB 연결 상태 · 알림 캘린더 · 확인 시각
+        # 4-3. 기한 확인 — NAS DB 연결 상태 · 알림 캘린더 · 확인 시각
         watch_frame, watch_box = section("기한 확인 (NAS iplog)")
         watch_row = qtw.QHBoxLayout()
         watch_row.setSpacing(10)
@@ -1902,7 +1924,7 @@ class MainWin(qtw.QWidget):
                                  "KIPRIS 로 확인하고 일정을 옮깁니다. 알림은 트레이 말풍선과 네이버 알림 캘린더(비우면 안 씀)에."))
         settings_main_layout.addWidget(watch_frame)
 
-        # 3-4. 메일 — 클래식 Outlook(COM) / 새 Outlook(Microsoft Graph)
+        # 4-4. 메일 — 클래식 Outlook(COM) / 새 Outlook(Microsoft Graph)
         mail_frame, mail_box = section("메일")
         mail_row = qtw.QHBoxLayout()
         mail_row.setSpacing(10)
@@ -1946,7 +1968,7 @@ class MainWin(qtw.QWidget):
         self._show_graph_rows()
         settings_main_layout.addWidget(mail_frame)
 
-        # 3-5. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
+        # 4-5. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
         abbr_frame, abbr_box = section("출원인 약칭")
         toolbar = qtw.QHBoxLayout()
         self.abbr_search = qtw.QLineEdit()
@@ -1993,6 +2015,7 @@ class MainWin(qtw.QWidget):
         # 좌측 아이콘 사이드바 + 우측 콘텐츠 스택
         self.stack = qtw.QStackedWidget()
         self.stack.addWidget(self.tab_tasks)
+        self.stack.addWidget(self.tab_search)
         self.stack.addWidget(self.tab_history)
         self.stack.addWidget(self.tab_settings)
 
@@ -2006,7 +2029,7 @@ class MainWin(qtw.QWidget):
         self.nav_group = qtw.QButtonGroup(self)
         self.nav_group.setExclusive(True)
 
-        nav_specs = [("tasks", "Tasks"), ("history", "History"), ("settings", "Settings")]
+        nav_specs = [("tasks", "Tasks"), ("search", "Search"), ("history", "History"), ("settings", "Settings")]
         for i, (icon_key, label) in enumerate(nav_specs):
             btn = qtw.QToolButton()
             btn.setObjectName("navBtn")
@@ -2022,6 +2045,7 @@ class MainWin(qtw.QWidget):
 
         self.nav_group.idClicked.connect(self.stack.setCurrentIndex)
         self.nav_group.button(0).setChecked(True)
+        qtg.QShortcut(qtg.QKeySequence(qtg.QKeySequence.StandardKey.Find), self, activated=self.show_search)      # Ctrl+F — 어느 탭에서든 메일 찾기
 
         content_row = qtw.QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
@@ -2301,6 +2325,12 @@ class MainWin(qtw.QWidget):
         if any(keyword in status for keyword in ("Existing", "완료", "Downloaded")):
             return "#E1EEE7", "#1B4B43"
         return "#F2F2F0", "#5F5E5A"
+
+    def show_search(self):
+        index = self.stack.indexOf(self.tab_search)
+        self.nav_group.button(index).setChecked(True)
+        self.stack.setCurrentIndex(index)
+        self.tab_search.focus_query()
 
     def _on_page_changed(self, index):
         """「설정 저장」 과 안내는 Settings 탭에서만 보인다."""
@@ -2617,7 +2647,7 @@ if __name__ == "__main__":
         QPushButton#secondaryButton:hover {
             background-color: #E1F5EE;
         }
-        QTableWidget#abbrTable {
+        QTableWidget#abbrTable, QTableWidget#mailTable {
             background-color: white;
             alternate-background-color: #F6F6F4;
             border: 1px solid #DCE3DF;
@@ -2625,10 +2655,10 @@ if __name__ == "__main__":
             selection-background-color: #E1F5EE;
             selection-color: #085041;
         }
-        QTableWidget#abbrTable::item {
+        QTableWidget#abbrTable::item, QTableWidget#mailTable::item {
             padding: 0 8px;
         }
-        QTableWidget#abbrTable QHeaderView::section {
+        QTableWidget#abbrTable QHeaderView::section, QTableWidget#mailTable QHeaderView::section {
             background-color: #F1EFE8;
             color: #5F5E5A;
             border: none;
