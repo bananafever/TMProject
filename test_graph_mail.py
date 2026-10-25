@@ -373,6 +373,29 @@ class TestMainGraph(unittest.TestCase):
         self.assertIsNone(box)
         self.assertIn("Microsoft 로그인", err)
 
+    def test_login_status_reads_saved_login(self):
+        """설정 창 — 켤 때마다 「확인하지 않았습니다」 가 아니라 저장된 로그인을 보인다."""
+        with patch.dict(main.config, {"graph_client_id": "", "graph_tenant_id": ""}):
+            self.assertIsNone(main.graph_login_status()[1])
+        with patch.dict(main.config, {"graph_client_id": "c", "graph_tenant_id": "t"}):
+            with patch.object(main.graph_mail, "Auth") as auth:
+                auth.return_value.signed_in.return_value = "me@x"
+                text, ok = main.graph_login_status()
+                self.assertTrue(ok)
+                self.assertIn("me@x", text)
+                auth.return_value.signed_in.return_value = ""
+                self.assertFalse(main.graph_login_status()[1])
+                auth.side_effect = RuntimeError("keychain")
+                self.assertFalse(main.graph_login_status()[1])
+
+    def test_login_required_is_graph_error_from_token(self):
+        """감시 중 로그인이 풀리면 Client 가 LoginRequired 를 그대로 낸다 — GraphWatcher 가 트레이로 한 번 알린다."""
+        app = MagicMock()
+        app.get_accounts.return_value = []
+        client = G.Client(G.Auth("c", "t", app=app), urlopen=lambda *a, **k: self.fail("요청하면 안 됨"))
+        with self.assertRaises(G.LoginRequired):
+            client.get("/me")
+
     def test_catch_up_without_mailbox_skips_scan(self):
         with patch.object(main, "retry_pending", return_value=[]), \
                 patch.object(main.naver_cal, "Session"), \

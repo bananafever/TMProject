@@ -1571,13 +1571,17 @@ class GraphWatcher(qtc.QObject):
     위임·예고 메일은 거의 다 받은편지함 밖((A)_NewTask)에 있다. 받아 오기는 스레드에서, 처리(일정 창·트레이 알림)는 GUI 스레드에서."""
 
     arrived = qtc.Signal(list)
+    login_lost = qtc.Signal(str)
 
-    def __init__(self, mailbox, parent=None):
+    def __init__(self, mailbox, parent=None, tray_icon=None):
         super().__init__(parent)
         self.mailbox = mailbox
+        self.tray_icon = tray_icon
         self._started = False
+        self._warned = False
         self._busy = threading.Lock()
         self.arrived.connect(self._handle)
+        self.login_lost.connect(self._warn_login)
         self.timer = qtc.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(60_000)
@@ -1597,10 +1601,21 @@ class GraphWatcher(qtc.QObject):
             messages = self.mailbox.poll()
             if messages:
                 self.arrived.emit(messages)
+            self._warned = False
+        except graph_mail.LoginRequired as e:   # 로그인이 풀림(회사 정책·오래 안 씀) — 1분마다 로그만 쌓지 않고 한 번 알린다
+            logging.error(f"Graph 새 메일 확인 실패: {e}")
+            if not self._warned:
+                self._warned = True
+                self.login_lost.emit(str(e))
         except Exception as e:
             logging.error(f"Graph 새 메일 확인 실패: {e}")
         finally:
             self._busy.release()
+
+    def _warn_login(self, text):
+        if self.tray_icon is not None:
+            self.tray_icon.showMessage("메일을 읽지 못합니다", f"{text} 설정 창 「메일」 에서 Microsoft 로그인을 하세요.",
+                                       qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
 
     def _handle(self, messages):
         for message in messages:
@@ -1608,6 +1623,24 @@ class GraphWatcher(qtc.QObject):
                 on_new_message(message, self.mailbox)
             except Exception as e:
                 logging.error(f"새 메일 처리 실패: {message.Subject} — {e}", exc_info=True)
+
+
+def graph_login_status(client_id=None, tenant_id=None):
+    """설정 창에 보일 Microsoft 로그인 상태 → (글, 됨 True·안 됨 False·해당 없음 None).
+    이 PC 에 저장된 로그인(토큰 캐시)만 본다 — 네트워크는 타지 않는다. 예전에는 켤 때마다 「로그인을 확인하지 않았습니다」 로
+    떠서, 로그인이 남아 있는데도 다시 해야 하는 것처럼 보였다(10-25)."""
+    if client_id is None:
+        client_id, tenant_id = config.get("graph_client_id", ""), config.get("graph_tenant_id", "")
+    if not (client_id and tenant_id):
+        return "「앱 ID 편집」 에서 Client ID·Tenant ID 를 넣은 뒤 로그인하세요", None
+    try:
+        user = graph_mail.Auth(client_id, tenant_id).signed_in()
+    except Exception as e:
+        logging.error(f"Microsoft 로그인 상태 확인 실패: {e}")
+        return f"로그인 상태를 읽지 못했습니다: {e}", False
+    if user:
+        return f"로그인되어 있음: {user} — 다시 로그인하지 않아도 됩니다", True
+    return "로그인이 필요합니다 — 「Microsoft 로그인」 을 누르세요", False
 
 
 class GraphLogin(qtc.QObject):
@@ -1895,8 +1928,9 @@ class MainWin(qtw.QWidget):
         login_row = qtw.QHBoxLayout(self.graph_login_row)
         login_row.setContentsMargins(0, 0, 0, 0)
         login_row.setSpacing(10)
-        self.graph_status = qtw.QLabel("로그인을 확인하지 않았습니다")
+        self.graph_status = qtw.QLabel()
         self.graph_status.setObjectName("settingsHint")
+        self._show_graph_status()
         self.graph_login_btn = qtw.QPushButton("Microsoft 로그인")
         self.graph_login_btn.setObjectName("secondaryButton")
         self.graph_login_btn.clicked.connect(self.graph_login_clicked)
@@ -1904,6 +1938,7 @@ class MainWin(qtw.QWidget):
         login_row.addWidget(self.graph_login_btn)
         mail_box.addWidget(self.graph_login_row)
         mail_box.addWidget(hint("새 Outlook 은 COM 을 지원하지 않아 Microsoft Graph 로 받은편지함을 읽습니다(읽기만). "
+                                "로그인은 한 번이면 이 PC 에 남아 다시 켜도 유지됩니다(회사 정책·오래 안 쓰면 가끔 다시 묻습니다). "
                                 "읽는 곳을 바꾸면 앱을 다시 켜야 합니다."))
         self.graph_login = GraphLogin(self)
         self.graph_login.done.connect(self._graph_login_done)
@@ -2300,6 +2335,13 @@ class MainWin(qtw.QWidget):
         if dialog.exec():
             self.graph_ids = dialog.values()
             self._show_graph_rows()
+            self._show_graph_status()
+
+    def _show_graph_status(self):
+        """이 PC 에 저장된 로그인 — 켤 때마다 「확인하지 않았습니다」 로 보여 다시 로그인하게 하던 것(10-25)."""
+        text, ok = graph_login_status(*self.graph_ids)
+        self.graph_status.setText(text)
+        self.graph_status.setStyleSheet("" if ok is None else ("color: #1E6B3A;" if ok else "color: #C0392B;"))
 
     def _equalize_bottom_buttons(self):
         """「설정 저장」 과 Quit 을 같은 폭·높이로 — 둘 중 큰 쪽에 맞춘다."""
@@ -2667,7 +2709,7 @@ if __name__ == "__main__":
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     # 창을 띄운 뒤: 실패했던 일정 다시 등록 + 꺼져 있던 동안 온 위임 메일 일정 등록 (예고 메일 스캔 다음)
     qtc.QTimer.singleShot(0, lambda: catch_up_calendar(mailbox))
-    graph_watcher = GraphWatcher(mailbox, mw) if is_graph(mailbox) else None
+    graph_watcher = GraphWatcher(mailbox, mw, mw.tray_icon) if is_graph(mailbox) else None
     if mail_error:
         logging.error(mail_error)
         mw.tray_icon.showMessage("메일을 읽지 못합니다", mail_error, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
