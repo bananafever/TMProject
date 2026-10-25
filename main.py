@@ -7,6 +7,7 @@ import shutil
 import stat
 import threading
 from datetime import date, datetime, timedelta
+from html import escape
 from time import sleep
 
 from dateutil.relativedelta import relativedelta
@@ -1600,6 +1601,51 @@ def open_mailbox():
         return None, f"클래식 Outlook 을 열지 못했습니다 — 새 Outlook 이면 설정 창 「메일」 에서 Graph 로 바꾸세요. ({e})"
 
 
+# ── History 탭 (app.log 보기) ──────────────────────────────────────────
+LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2},\d+ - (\w+) - (.*)$")
+LOG_LEVEL_TAGS = {   # 등급 → (꼬리표 배경, 글자색, 꼬리표). INFO 는 꼬리표 없이
+    "ERROR": ("#FAECE7", "#993C1D", "오류"),
+    "CRITICAL": ("#FAECE7", "#993C1D", "오류"),
+    "WARNING": ("#FDF3E1", "#8A5300", "경고"),
+}
+HISTORY_MAX_LINES = 3000
+
+
+def history_html(log_text):
+    """app.log 를 History 탭용 HTML 로 — 날짜별로 묶고, 시각은 흐리게, 오류·경고는 색 꼬리표.
+    시각으로 시작하지 않는 줄(트레이스백)은 앞 줄 아래에 작게 붙인다."""
+    entries = []   # [날짜, 시각, 등급, 메시지, [붙은 줄]]
+    for line in log_text.splitlines()[-HISTORY_MAX_LINES:]:
+        m = LOG_LINE.match(line)
+        if m:
+            entries.append([*m.groups(), []])
+        elif line.strip() and entries:
+            entries[-1][4].append(line)
+    if not entries:
+        return "<p style='color:#8A877E;'>기록이 없습니다.</p>"
+
+    parts, day = [], None
+    for date_text, time_text, level, message, extra in entries:
+        if date_text != day:
+            if day is not None:
+                parts.append("</table>")
+            day = date_text
+            weekday = "월화수목금토일"[date.fromisoformat(date_text).weekday()]
+            parts.append(f"<p style='margin:14px 0 4px 0; color:#26695E; font-weight:bold;'>"
+                         f"{date_text} ({weekday})</p>")
+            parts.append("<table width='100%' cellspacing='0' cellpadding='3'>")
+        bg, fg, tag = LOG_LEVEL_TAGS.get(level, ("", "#333333", ""))
+        tag_html = f"<span style='background-color:{bg}; color:{fg};'>&nbsp;{tag}&nbsp;</span>" if tag else ""
+        body = escape(message)
+        if extra:
+            body += ("<br><span style='font-family:Consolas; font-size:8.5pt; color:#8A877E;'>"
+                     + "<br>".join(escape(x) for x in extra) + "</span>")
+        parts.append(f"<tr><td width='44' style='color:#8A877E;'>{time_text}</td>"
+                     f"<td width='36'>{tag_html}</td><td style='color:{fg};'>{body}</td></tr>")
+    parts.append("</table>")
+    return "".join(parts)
+
+
 class MainWin(qtw.QWidget):
 
     def __init__(self, attach_list):
@@ -1658,7 +1704,10 @@ class MainWin(qtw.QWidget):
         history_layout.addLayout(btn_layout_history)
 
         self.history_text = qtw.QTextEdit()
+        self.history_text.setObjectName("historyText")
         self.history_text.setReadOnly(True)
+        self.history_text.setWordWrapMode(qtg.QTextOption.WrapAtWordBoundaryOrAnywhere)  # 긴 URL 도 접는다
+        self.history_text.document().setDocumentMargin(12)
         history_layout.addWidget(self.history_text)
 
         self.load_history()
@@ -1955,7 +2004,7 @@ class MainWin(qtw.QWidget):
     def load_history(self):
         try:
             with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                self.history_text.setPlainText(f.read())
+                self.history_text.setHtml(history_html(f.read()))
             self.history_text.moveCursor(qtg.QTextCursor.End)
         except Exception as e:
             self.history_text.setPlainText(f"로그 파일을 읽을 수 없습니다: {e}")
@@ -2459,6 +2508,34 @@ if __name__ == "__main__":
         QScrollArea, #cardsContainer {
             background-color: transparent;
             border: none;
+        }
+        #historyText {
+            border-radius: 12px;
+            padding: 0;
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 10px;
+            margin: 4px 2px 4px 0;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #CBD3CF;
+            border-radius: 4px;
+            min-height: 40px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background-color: #9FC9BF;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background-color: #26695E;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0;
+            border: none;
+            background: none;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: none;
         }
         #quitButton {
             background-color: white;
