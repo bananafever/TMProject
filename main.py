@@ -2358,11 +2358,13 @@ if __name__ == "__main__":
             font-weight: bold;
         }
         #cardTitle {
+            background-color: transparent;
             color: #232220;
             font-size: 10pt;
             font-weight: bold;
         }
         #cardSubtitle {
+            background-color: transparent;
             color: #8A877E;
             font-size: 9pt;
         }
