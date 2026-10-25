@@ -241,7 +241,7 @@ class TestCheckExtensions(unittest.TestCase):
         self.assertEqual(len(ups), 3)
         drift_sql, drift_params = conn.executed[2]
         self.assertIn("p.ext_status <> 'requested'", drift_sql)
-        self.assertEqual(drift_params, ("2026-10-16", "2026-11-06"))
+        self.assertEqual(drift_params, ("2026-10-16", "2026-10-30"))
         self.assertEqual(alerts[-1].title, "기연 요청 없이 대응기한이 바뀜 2건")
 
     def test_drift_corrects_counted_extension(self):

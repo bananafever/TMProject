@@ -32,7 +32,7 @@ CATCHUP_DAYS = 7                     # 이보다 오래 꺼져 있었으면 그 
 GRACE = timedelta(minutes=10)        # 정한 시각보다 이만큼 넘게 늦게 돌면 「늦은 알림」
 RETRY_AFTER = timedelta(minutes=10)  # NAS 에 못 닿으면 이만큼 뒤에 다시
 EXT_LOOKBACK_DAYS = 7                # 기연신청서가 안 보였거나 KIPRIS 오류였던 차수는 요청 뒤 이만큼 날마다 다시 본다
-DRIFT_AHEAD_DAYS = 14                # 기연 요청 없이 기한이 바뀌었나 — 대응기한이 이 안에 드는 차수만
+DRIFT_AHEAD_DAYS = 7                 # 기연 요청 없이 기한이 바뀌었나 — 대응기한이 이 안에 드는 차수만
 DRIFT_BEHIND_DAYS = 7                #   (기한 당일 기연 → KIPRIS 반영은 하루 이틀 늦다)
 CLOSED_STATUSES = ("completed", "allowed", "abandoned")
 LATE_PREFIX = "늦은 알림"
