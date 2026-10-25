@@ -154,7 +154,7 @@ def make_icon(svg_key, color="#3A3A38", size=20):
 
 
 def setup_app_fonts(app):
-    """assets/fonts에 번들된 Pretendard를 등록하고 앱 전역 글꼴로 지정합니다."""
+    """assets/fonts에 번들된 Pretendard를 등록하고 앱 전역 글꼴로 지정합니다. app.setStyleSheet 뒤에 부른다."""
     font_dir = resource_path(os.path.join("assets", "fonts"))
     if os.path.isdir(font_dir):
         for f in os.listdir(font_dir):
@@ -167,6 +167,8 @@ def setup_app_fonts(app):
     font.setStyleStrategy(qtg.QFont.PreferAntialias)
     font.setHintingPreference(qtg.QFont.PreferNoHinting)
     app.setFont(font)
+    # 메시지 상자는 Windows 메시지 상자 글꼴에서 출발해 힌팅 끔을 물려받지 못한다 — 클래스에 앱 글꼴을 직접
+    app.setFont(font, "QMessageBox")
 
 
 def use_app_font(*widgets):
@@ -2450,7 +2452,6 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
     app = qtw.QApplication(sys.argv)
-    setup_app_fonts(app)
 
     # pdfProject Clean Light 테마 참고 (웜 뉴트럴 캔버스 + 틸/오렌지 액센트)
     app.setStyleSheet("""
@@ -2659,6 +2660,7 @@ if __name__ == "__main__":
             border-color: #042C53;
         }
     """)
+    setup_app_fonts(app)  # 스타일시트 뒤에 — 스타일시트를 입히면 클래스별 글꼴(메시지 상자)이 Windows 값으로 돌아간다
 
     app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
