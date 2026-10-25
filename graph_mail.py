@@ -34,8 +34,10 @@ SCOPES = ["Mail.Read", "User.Read"]
 TIMEOUT = 20
 RETRIES = 4
 TRANSLATE_BATCH = 1000                                  # translateExchangeIds 한 번에 넣을 수 있는 수
-LIST_FIELDS = "id,subject,from,receivedDateTime,createdDateTime,hasAttachments"
-NEW_MAIL_SLACK = timedelta(minutes=5)                   # 감시를 켜기 조금 전에 받은 메일도 새 메일로 본다
+LIST_FIELDS = "id,subject,from,receivedDateTime,createdDateTime,hasAttachments,parentFolderId"
+NEW_MAIL_SLACK = timedelta(minutes=5)                   # 받은 시각이 서버마다 조금 늦게 잡혀도 놓치지 않게 겹쳐 본다
+# 새 메일 감시에서 뺄 폴더 — 클래식 OnNewMailEx 처럼 「받은」 메일만(규칙이 다른 폴더로 옮긴 것은 본다)
+NOT_RECEIVED_FOLDERS = ("sentitems", "drafts", "outbox", "deleteditems")
 OL_EMBEDDED_ITEM = 5                                    # instruction_mail 과 같은 COM 값 — 항목으로 붙은 메일
 _PROP = "http://schemas.microsoft.com/mapi/proptag/"
 PR_ATTACH_CONTENT_ID = _PROP + "0x3712001F"
@@ -147,14 +149,10 @@ class Client:
     def get(self, url, **kw):
         return self.call("GET", url, **kw)
 
-    def pages(self, url: str, headers=None, tail: Optional[dict] = None) -> Iterable[dict]:
-        """`value` 를 차례로 — `@odata.nextLink` 를 따라간다. 마지막 응답(deltaLink 포함)은 tail 에(주면).
-        시작 스캔(GUI 스레드)과 새 메일 감시(뒤 스레드)가 함께 부르므로 공유 속성에 두지 않는다."""
+    def pages(self, url: str, headers=None) -> Iterable[dict]:
+        """`value` 를 차례로 — `@odata.nextLink` 를 따라간다."""
         while url:
             page = self.get(url, headers=headers)
-            if tail is not None:
-                tail.clear()
-                tail.update(page)
             yield from page.get("value", [])
             url = page.get("@odata.nextLink")
 
@@ -314,6 +312,7 @@ class GraphMessage:
         self.ReceivedTime = local_time(data.get("receivedDateTime"))
         self.CreationTime = local_time(data.get("createdDateTime")) or self.ReceivedTime
         self.EntryID = entry_id
+        self.parent_folder_id = data.get("parentFolderId", "")
         self._body, self._attachments = data.get("body"), None
 
     def _load_body(self):
@@ -371,15 +370,26 @@ def _matches(message: GraphMessage, senders, subject_like) -> bool:
 
 
 class GraphMailbox:
-    """main 이 클래식 Outlook 네임스페이스 대신 받는 메일함. 받은편지함만 본다."""
+    """main 이 클래식 Outlook 네임스페이스 대신 받는 메일함. 시작 스캔은 받은편지함, 새 메일 감시는 모든 받은 폴더."""
 
     source = "graph"
 
     def __init__(self, client: Client):
         self.client = client
-        self._delta = None
+        self._inbox_id = None
+        self._skip = None
+        self._since = None
         self._seen = set()
-        self._watch_since = None
+
+    @property
+    def inbox_id(self) -> str:
+        if self._inbox_id is None:
+            self._inbox_id = self.client.get("/me/mailFolders/inbox?$select=id")["id"]
+        return self._inbox_id
+
+    def is_inbox(self, message) -> bool:
+        """지금 받은편지함에 있는가 — 받은 지시는 받은편지함만 본다(사용자 10-24)."""
+        return bool(message.parent_folder_id) and message.parent_folder_id == self.inbox_id
 
     def translate(self, ids: List[str]) -> Dict[str, str]:
         """Graph immutable id → 클래식 EntryID(hex)."""
@@ -413,32 +423,35 @@ class GraphMailbox:
         url = "/me/mailFolders/inbox/messages?" + urllib.parse.urlencode(query)
         return self._wrap(list(self.client.pages(url)), senders, subject_like)
 
+    def _received_since(self, since: datetime) -> List[dict]:
+        query = {"$select": LIST_FIELDS, "$top": "200", "$orderby": "receivedDateTime desc",
+                 "$filter": "receivedDateTime ge " + since.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        return list(self.client.pages("/me/messages?" + urllib.parse.urlencode(query)))
+
     def start_watch(self, now: Optional[datetime] = None):
-        """새 메일 감시 시작 — 지금 받은편지함 상태를 delta 로 받아 두고(처리하지 않음), 이후 poll 이 새로 온 것만 낸다."""
+        """새 메일 감시 시작 — 지금 와 있는 메일은 본 것으로 두고(처리하지 않음), 이후 poll 이 새로 온 것만 낸다.
+
+        클래식 OnNewMailEx 는 서버 규칙이 다른 폴더(예: (A)_NewTask)로 옮긴 메일에도 울린다 — 실제로 위임·예고 메일은
+        거의 다 받은편지함 밖에 있다(10-25 실측). 그래서 받은편지함 delta 가 아니라 모든 폴더의 받은 시각으로 본다.
+        """
         now = now or datetime.now(timezone.utc)
-        self._watch_since = now - NEW_MAIL_SLACK
-        query = {"$select": LIST_FIELDS, "$filter": "receivedDateTime ge " +
-                 (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
-        url = "/me/mailFolders/inbox/messages/delta?" + urllib.parse.urlencode(query)
-        tail = {}
-        self._seen = {row["id"] for row in self.client.pages(url, headers={"Prefer": "odata.maxpagesize=100"}, tail=tail)}
-        self._delta = tail.get("@odata.deltaLink")
-        if not self._delta:
-            raise GraphError("delta 링크를 받지 못했습니다.")
+        self._skip = {self.client.get(f"/me/mailFolders/{name}?$select=id")["id"] for name in NOT_RECEIVED_FOLDERS}
+        self._since = now - NEW_MAIL_SLACK
+        self._seen = {row["id"] for row in self._received_since(self._since)}
 
     def poll(self) -> List[GraphMessage]:
-        """지난 poll 뒤로 받은편지함에 새로 들어온 메일(오래된 순). 읽음 표시·삭제·옛 메일을 옮겨 온 것은 빼고."""
-        if not self._delta:
+        """지난 poll 뒤로 새로 받은 메일(오래된 순) — 보낸·임시·지운 편지함은 빼고. 옛 메일을 옮긴 것은 받은 시각이 지나 안 잡힌다."""
+        if self._since is None:
             raise GraphError("start_watch 를 먼저 불러야 합니다.")
-        rows, tail = [], {}
-        for row in self.client.pages(self._delta, headers={"Prefer": "odata.maxpagesize=100"}, tail=tail):
-            if "@removed" in row or row["id"] in self._seen or "receivedDateTime" not in row:
+        rows = []
+        for row in self._received_since(self._since):
+            if row["id"] in self._seen:
                 continue
             self._seen.add(row["id"])
-            received = datetime.fromisoformat(row["receivedDateTime"].replace("Z", "+00:00"))
-            if received >= self._watch_since:
+            if row.get("parentFolderId") not in self._skip:
                 rows.append(row)
-        self._delta = tail.get("@odata.deltaLink") or self._delta
+            received = datetime.fromisoformat(row["receivedDateTime"].replace("Z", "+00:00"))
+            self._since = max(self._since, received - NEW_MAIL_SLACK)
         rows.sort(key=lambda r: r["receivedDateTime"])
         return self._wrap(rows)
 

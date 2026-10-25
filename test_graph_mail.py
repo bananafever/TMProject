@@ -67,15 +67,12 @@ class FakeClient:
     def get(self, url, **kw):
         return self.call("GET", url, **kw)
 
-    def pages(self, url, headers=None, tail=None):
+    def pages(self, url, headers=None):
         self.calls.append(("PAGES", url, None))
         pages = self.page_routes[url.split("?")[0]]
         if callable(pages):
             pages = pages()
         for page in pages:
-            if tail is not None:
-                tail.clear()
-                tail.update(page)
             yield from page.get("value", [])
 
 
@@ -174,19 +171,16 @@ class TestClient(unittest.TestCase):
         with self.assertRaisesRegex(G.GraphError, "403 busy"):
             G.Client(self._auth(), urlopen=urlopen, sleep=lambda s: None).get("/me")
 
-    def test_pages_follow_next_link_and_keep_tail(self):
-        answers = [self._resp({"value": [1, 2], "@odata.nextLink": G.GRAPH + "/next"}),
-                   self._resp({"value": [3], "@odata.deltaLink": "D"})]
+    def test_pages_follow_next_link(self):
+        answers = [self._resp({"value": [1, 2], "@odata.nextLink": G.GRAPH + "/next"}), self._resp({"value": [3]})]
         urls = []
 
         def urlopen(req, timeout):
             urls.append(req.full_url)
             return answers.pop(0)
-        tail = {}
-        got = list(G.Client(self._auth(), urlopen=urlopen, sleep=lambda s: None).pages("/a", tail=tail))
+        got = list(G.Client(self._auth(), urlopen=urlopen, sleep=lambda s: None).pages("/a"))
         self.assertEqual(got, [1, 2, 3])
         self.assertEqual(urls, [G.GRAPH + "/a", G.GRAPH + "/next"])
-        self.assertEqual(tail["@odata.deltaLink"], "D")
 
 
 class TestMailbox(unittest.TestCase):
@@ -217,40 +211,35 @@ class TestMailbox(unittest.TestCase):
         with self.assertRaises(G.GraphError):
             G.GraphMailbox(client).translate(["A"])
 
-    def test_watch_returns_only_new_mail(self):
-        delta = "/me/mailFolders/inbox/messages/delta"
+    def test_watch_sees_rule_moved_mail_not_sent_or_old(self):
+        """클래식 OnNewMailEx 처럼 — 규칙이 (A)_NewTask 로 옮긴 새 메일도 잡고, 보낸 편지함·옛 메일은 뺀다."""
+        folders = {f"/me/mailFolders/{n}": {"id": n.upper()} for n in G.NOT_RECEIVED_FOLDERS}
+        folders["/me/mailFolders/inbox"] = {"id": "INBOX"}
         now = datetime(2099, 10, 22, 14, 0, tzinfo=timezone.utc)
         rounds = [
-            [{"value": [_row("OLD", "x", "S", "2099-10-22T09:00:00Z")], "@odata.deltaLink": "D1"}],
-            [{"value": [_row("NEW2", "b", "S", "2099-10-22T14:03:00Z"),
-                        _row("NEW1", "a", "S", "2099-10-22T14:02:00Z"),
-                        {"id": "OLD", "isRead": True},                                       # 읽음 표시
-                        {"id": "GONE", "@removed": {"reason": "deleted"}},
-                        _row("MOVED", "옛 메일을 옮겨 옴", "S", "2099-10-01T09:00:00Z")],
-              "@odata.deltaLink": "D2"}],
-            [{"value": [_row("NEW1", "a", "S", "2099-10-22T14:02:00Z")], "@odata.deltaLink": "D3"}],
+            [_row("EARLY", "x", "S", "2099-10-22T13:58:00Z", parentFolderId="INBOX")],          # 켜기 전 — 처리 안 함
+            [_row("NEW2", "b", "S", "2099-10-22T14:03:00Z", parentFolderId="NEWTASK"),
+             _row("SENT", "re", "me", "2099-10-22T14:02:30Z", parentFolderId="SENTITEMS"),
+             _row("NEW1", "a", "S", "2099-10-22T14:02:00Z", parentFolderId="INBOX"),
+             _row("EARLY", "x", "S", "2099-10-22T13:58:00Z", parentFolderId="INBOX")],
+            [_row("NEW2", "b", "S", "2099-10-22T14:03:00Z", parentFolderId="NEWTASK")],
         ]
         urls = []
-        client = FakeClient()
-
-        def pages(url, headers=None, tail=None):
-            urls.append(url)
-            for page in rounds.pop(0):
-                tail.clear()
-                tail.update(page)
-                yield from page["value"]
-        client.pages = pages
+        client = FakeClient(routes=folders)
+        client.pages = lambda url, headers=None: (urls.append(url), iter(rounds.pop(0)))[1]
         box = G.GraphMailbox(client)
         with self.assertRaises(G.GraphError):
             box.poll()                                                            # start_watch 전
         box.start_watch(now)
-        self.assertTrue(urls[0].startswith(delta + "?"))
+        self.assertTrue(urls[0].startswith("/me/messages?"))
+        self.assertIn("receivedDateTime+ge+2099-10-22T13%3A55%3A00Z", urls[0])
         got = box.poll()
-        self.assertEqual([m.id for m in got], ["NEW1", "NEW2"])                    # 오래된 순, 새 메일만
-        self.assertEqual(got[0].EntryID, _eid("NEW1"))
-        self.assertEqual(urls[1], "D1")
+        self.assertEqual([m.id for m in got], ["NEW1", "NEW2"])                    # 오래된 순, 새로 받은 것만
+        self.assertEqual(got[1].EntryID, _eid("NEW2"))
         self.assertEqual(box.poll(), [])                                           # 이미 낸 메일은 다시 안 낸다
-        self.assertEqual(urls[2], "D2")
+        self.assertIn("2099-10-22T13%3A58%3A00Z", urls[2])                          # 본 것 가운데 가장 늦은 시각 − 5분부터
+        self.assertTrue(box.is_inbox(got[0]))
+        self.assertFalse(box.is_inbox(got[1]))
 
     def test_open_mailbox_needs_ids(self):
         with self.assertRaises(G.LoginRequired):
@@ -341,8 +330,12 @@ class TestMainGraph(unittest.TestCase):
         self.assertTrue(main.sender_matches(m, ["DoNotReply"]))
         self.assertFalse(main.sender_matches(m, ["Someone"]))
 
-    def test_graph_mail_is_in_inbox(self):
-        self.assertTrue(main.in_inbox(self._message("x", "y"), None))
+    def test_instruction_only_from_inbox(self):
+        box = G.GraphMailbox(FakeClient(routes={"/me/mailFolders/inbox": {"id": "INBOX"}}))
+        inbox = G.GraphMessage(FakeClient(), _row("M", "x", "y", parentFolderId="INBOX"), "E")
+        moved = G.GraphMessage(FakeClient(), _row("M", "x", "y", parentFolderId="NEWTASK"), "E")
+        self.assertTrue(main.in_inbox(inbox, box))
+        self.assertFalse(main.in_inbox(moved, box))
 
     def test_inbox_items_routes_to_graph(self):
         box = G.GraphMailbox(FakeClient())

@@ -583,9 +583,10 @@ def instruction_senders():
 
 
 def in_inbox(message, outlook) -> bool:
-    """처리하는 지금 받은편지함에 있는가 — 받은편지함만 본다(사용자 10-24). Graph 는 받은편지함에서만 받아 온다."""
+    """처리하는 지금 받은편지함에 있는가 — 받은편지함만 본다(사용자 10-24).
+    Graph 새 메일 감시는 규칙이 옮긴 폴더까지 보므로 메일의 폴더를 받은편지함 id 와 견준다."""
     if is_graph(message):
-        return True
+        return is_graph(outlook) and outlook.is_inbox(message)
     try:
         return message.Parent.EntryID == outlook.GetDefaultFolder(6).EntryID
     except Exception:                                   # noqa: BLE001
@@ -1517,8 +1518,8 @@ class Handler_Class:
 
 
 class GraphWatcher(qtc.QObject):
-    """새 Outlook(Graph) — 1분마다 받은편지함에 새로 온 메일을 본다(클래식의 OnNewMailEx 자리).
-    받아 오기는 스레드에서, 처리(일정 창·트레이 알림)는 GUI 스레드에서."""
+    """새 Outlook(Graph) — 1분마다 새로 받은 메일을 본다(클래식의 OnNewMailEx 자리). 규칙이 옮긴 폴더의 메일도 —
+    위임·예고 메일은 거의 다 받은편지함 밖((A)_NewTask)에 있다. 받아 오기는 스레드에서, 처리(일정 창·트레이 알림)는 GUI 스레드에서."""
 
     arrived = qtc.Signal(list)
 
@@ -1541,7 +1542,7 @@ class GraphWatcher(qtc.QObject):
     def _run(self):
         try:
             if not self._started:
-                self.mailbox.start_watch()     # 지금 받은편지함 상태만 받아 둔다 — 지난 메일은 시작 스캔이 처리했다
+                self.mailbox.start_watch()     # 지금 와 있는 메일은 본 것으로 — 지난 메일은 시작 스캔이 처리했다
                 self._started = True
                 return
             messages = self.mailbox.poll()
