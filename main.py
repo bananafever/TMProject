@@ -137,6 +137,15 @@ NAV_ICONS = {
         <circle cx="13" cy="10" r="1.8" fill="{color}"/>
         <circle cx="9" cy="14" r="1.8" fill="{color}"/>
         </svg>""",
+    "eye": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <path d="M2.5 10 C4.5 6 7 4.5 10 4.5 C13 4.5 15.5 6 17.5 10 C15.5 14 13 15.5 10 15.5 C7 15.5 4.5 14 2.5 10 Z" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>
+        <circle cx="10" cy="10" r="2.5" fill="none" stroke="{color}" stroke-width="1.5"/>
+        </svg>""",
+    "eye_off": """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+        <path d="M2.5 10 C4.5 6 7 4.5 10 4.5 C13 4.5 15.5 6 17.5 10 C15.5 14 13 15.5 10 15.5 C7 15.5 4.5 14 2.5 10 Z" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>
+        <circle cx="10" cy="10" r="2.5" fill="none" stroke="{color}" stroke-width="1.5"/>
+        <path d="M3.5 3.5 L16.5 16.5" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>""",
 }
 
 
@@ -1139,7 +1148,7 @@ class ScheduleDialog(qtw.QDialog):
 
 
 def parse_names(text):
-    """「이여름, 한송희」 → ["이여름", "한송희"] (공백 정리, 빈 이름·중복 제거)."""
+    """「홍길동, 김철수」 → ["홍길동", "김철수"] (공백 정리, 빈 이름·중복 제거)."""
     return list(dict.fromkeys(n for n in (squash(t) for t in (text or "").split(",")) if n))
 
 
@@ -1770,9 +1779,16 @@ class MainWin(qtw.QWidget):
         cal_frame, cal_box = section("일정 등록")
         cal_box.addWidget(qtw.QLabel("위임 메일 담당자"))
         self.assignees_edit = qtw.QLineEdit(", ".join(calendar_assignees()))
-        self.assignees_edit.setPlaceholderText("이여름, 한송희")
+        self.assignees_edit.setPlaceholderText("홍길동, 김철수")
+        # 이름은 평소 ●●● 로 가리고 칸 오른쪽 눈 버튼으로 보인다 (Settings 탭을 떠나면 다시 가린다)
+        self.assignees_eye = self.assignees_edit.addAction(make_icon("eye", "#8A877E", 18),
+                                                           qtw.QLineEdit.TrailingPosition)
+        self.assignees_eye.setCheckable(True)
+        self.assignees_eye.toggled.connect(self._show_assignees)
+        self._show_assignees(False)
         cal_box.addWidget(self.assignees_edit)
-        cal_box.addWidget(hint("쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다."))
+        cal_box.addWidget(hint("쉼표로 구분 · 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록합니다. "
+                               "눈 버튼을 눌러 이름을 보이게 한 뒤 고칩니다."))
         cal_box.addStretch()
 
         top_row = qtw.QHBoxLayout()
@@ -2104,7 +2120,7 @@ class MainWin(qtw.QWidget):
         config["graph_tenant_id"] = self.graph_tenant_edit.text().strip()
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
-                     f"담당자: {config['calendar_assignees']}, 약칭 {len(config['applicant_abbr'])}개, "
+                     f"담당자 {len(config['calendar_assignees'])}명, 약칭 {len(config['applicant_abbr'])}개, "
                      f"알림 캘린더: {config['alert_calendar'] or '(없음)'}, 확인 시각: {config['deadline_times']}, "
                      f"메일: {config['mail_backend']}")
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다."
@@ -2210,6 +2226,14 @@ class MainWin(qtw.QWidget):
         self.save_btn.setVisible(on_settings)
         if on_settings:
             self._fit_abbr_column()
+        else:
+            self.assignees_eye.setChecked(False)
+
+    def _show_assignees(self, shown):
+        """위임 메일 담당자 이름 — 눈 버튼으로 보이기/가리기. 가린 동안은 한글 입력이 안 되므로 보인 뒤 고친다."""
+        self.assignees_edit.setEchoMode(qtw.QLineEdit.Normal if shown else qtw.QLineEdit.Password)
+        self.assignees_eye.setIcon(make_icon("eye_off" if shown else "eye", "#8A877E", 18))
+        self.assignees_eye.setToolTip("이름 가리기" if shown else "이름 보기")
 
     def _equalize_bottom_buttons(self):
         """「설정 저장」 과 Quit 을 같은 폭·높이로 — 둘 중 큰 쪽에 맞춘다."""
