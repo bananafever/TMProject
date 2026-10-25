@@ -1,4 +1,4 @@
-"""받은 지시 — 받은편지함의 고객 지시 메일을 골라 .msg 로 두고 NAS `instructions` 에 적는다. Qt·네이버를 모른다.
+"""받은 지시 — 받은편지함의 고객 지시 메일을 골라 .msg(Graph 는 .eml)로 두고 NAS `instructions` 에 적는다. Qt·네이버를 모른다.
 
 CPProject `docs/INSTRUCTION_MAIL_PLAN.md` 6절. 확정(사건·서신으로 넣기·할 일)은 ChekPat 「받은 지시」 가 한다.
 
@@ -96,11 +96,11 @@ def wants_alert(subject: str, body: str) -> bool:
     return bool(EXTENSION.search(client_part(body)))
 
 
-def msg_file(root: str, received, ref: str, entry_id: str) -> str:
-    """`<자료 폴더>\\instructions\\YYYY-MM\\YYYYMMDD-HHMM_<Ref>_<EntryID 끝 8자>.msg`."""
+def msg_file(root: str, received, ref: str, entry_id: str, ext: str = ".msg") -> str:
+    """`<자료 폴더>\\instructions\\YYYY-MM\\YYYYMMDD-HHMM_<Ref>_<EntryID 끝 8자>.msg` — Graph 로 읽은 메일은 `.eml`."""
     safe = re.sub(r"[^A-Za-z0-9-]", "", ref or "") or "NOREF"
     return os.path.join(root, MSG_DIR, received.strftime("%Y-%m"),
-                        "%s_%s_%s.msg" % (received.strftime("%Y%m%d-%H%M"), safe, (entry_id or "")[-8:]))
+                        "%s_%s_%s%s" % (received.strftime("%Y%m%d-%H%M"), safe, (entry_id or "")[-8:], ext))
 
 
 def _prop(att, tag):
@@ -168,7 +168,7 @@ def received_of(message):
         return message.CreationTime
 
 
-def build_row(message, ref: str, msg_path: str, from_name: str, session=None) -> dict:
+def build_row(message, ref: str, msg_path: str, from_name: str, session=None, source: str = "outlook") -> dict:
     """`instructions` 한 줄(db.INSTRUCTION_COLUMNS). 원 발신인·고객 날짜는 ChekPat 이 본문에서 푼다."""
     names, embedded = attachments(message)
     orig_text, orig_head = read_embedded(embedded[0], session) if embedded and session is not None else ("", "")
@@ -184,12 +184,14 @@ def build_row(message, ref: str, msg_path: str, from_name: str, session=None) ->
         "orig_text": orig_text or None,
         "orig_head": orig_head or None,
         "msg_path": msg_path,
-        "source": "outlook",
+        "source": source,
     }
 
 
-def handle(message, ref: str, data_root: str, from_name: str, session=None, connect_fn=None) -> Optional[dict]:
+def handle(message, ref: str, data_root: str, from_name: str, session=None, connect_fn=None,
+           source: str = "outlook") -> Optional[dict]:
     """고른 메일 하나 — .msg 저장 + NAS 한 줄(못 쓰면 쌓기). 이미 적은 메일이면 None.
+    source "graph" 는 새 Outlook(graph_mail) — 원본을 .eml 로 둔다(ChekPat 은 둘 다 읽는다).
 
     반환값: {"ref", "alert"(연장 낱말), "result"(db.record)}
     """
@@ -197,7 +199,7 @@ def handle(message, ref: str, data_root: str, from_name: str, session=None, conn
     if db.is_recorded(state, message.EntryID):
         return None
     received = received_of(message)
-    path = msg_file(data_root, received, ref, message.EntryID)
+    path = msg_file(data_root, received, ref, message.EntryID, ".eml" if source == "graph" else ".msg")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if not os.path.exists(path):
@@ -205,7 +207,7 @@ def handle(message, ref: str, data_root: str, from_name: str, session=None, conn
     except Exception as e:                              # noqa: BLE001 — .msg 를 못 둬도 줄은 적는다(ChekPat 은 본문으로)
         logging.error(f"받은 지시 .msg 저장 실패: {path} — {e}")
         path = ""
-    row = build_row(message, ref, path or None, from_name, session)
+    row = build_row(message, ref, path or None, from_name, session, source)
     result = db.record([row], state, connect_fn=connect_fn, table=db.INSTRUCTIONS)
     alert = wants_alert(message.Subject, row["body_text"])
     logging.info(f"받은 지시: {ref or '-'} · {message.Subject}" + (" · 연장 낱말" if alert else ""))

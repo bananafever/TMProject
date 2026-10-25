@@ -20,6 +20,8 @@ def build_exe():
         "win32timezone", # Outlook 연동시 필요할 수 있음
         "pymysql",       # NAS iplog (db.py 가 함수 안에서 들인다)
         "pymysql.cursors",
+        "msal",          # 새 Outlook(Graph) 로그인 — graph_mail 이 함수 안에서 들인다
+        "msal_extensions",
     ]
 
     # 2. PyInstaller 인자 구성

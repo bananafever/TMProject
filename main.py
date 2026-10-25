@@ -9,22 +9,6 @@ import threading
 from datetime import date, datetime, timedelta
 from time import sleep
 
-try:
-    import win32com.client
-except Exception:
-    # gen_py 캐시가 손상된 경우 (%LOCALAPPDATA%\Temp\gen_py 등) 자동 삭제 후 재시도
-    import tempfile
-    gen_py_dirs = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Temp\gen_py"),
-        os.path.join(tempfile.gettempdir(), "gen_py"),
-    ]
-    for d in gen_py_dirs:
-        if os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("win32com"):
-            del sys.modules[mod]
-    import win32com.client
 from dateutil.relativedelta import relativedelta
 from PySide6 import QtCore as qtc
 from PySide6 import QtGui as qtg
@@ -33,6 +17,7 @@ from PySide6 import QtSvg as qts
 
 import db
 import deadline_watch
+import graph_mail
 import instruction_mail
 import kipris
 import naver_cal
@@ -94,6 +79,10 @@ DEFAULT_CONFIG = {
     "deadline_times": dict(deadline_watch.DEFAULT_TIMES),
     # 받은 지시 — 고객 메일을 전달(FW:)하는 대표 메일함의 보낸 사람 이름. 받은편지함의 이 메일을 NAS instructions 에 적는다
     "instruction_senders": list(instruction_mail.DEFAULT_SENDERS),
+    # 메일을 읽는 곳 — "outlook"(클래식 Outlook COM) · "graph"(Microsoft Graph, 새 Outlook). graph 는 아래 두 값이 있어야 한다
+    "mail_backend": "outlook",
+    "graph_client_id": "",
+    "graph_tenant_id": "",
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -242,6 +231,32 @@ def safe_remove_path(path, retries=5, delay=0.1):
                 raise e
 
 
+def import_win32com():
+    """클래식 Outlook(COM)을 쓸 때만 들인다 — Graph·맥에서는 pywin32 가 없어도 된다."""
+    try:
+        import win32com.client
+    except Exception:
+        # gen_py 캐시가 손상된 경우 (%LOCALAPPDATA%\Temp\gen_py 등) 자동 삭제 후 재시도
+        import tempfile
+        gen_py_dirs = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Temp\gen_py"),
+            os.path.join(tempfile.gettempdir(), "gen_py"),
+        ]
+        for d in gen_py_dirs:
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("win32com"):
+                del sys.modules[mod]
+        import win32com.client
+    return win32com.client
+
+
+def is_graph(obj):
+    """Graph 쪽 메일함·메일인가 — 클래식 Outlook COM 객체(시험에서는 MagicMock)와 가른다."""
+    return isinstance(obj, (graph_mail.GraphMailbox, graph_mail.GraphMessage))
+
+
 # Outlook Object Model Guard는 MailItem.SenderName 같은 주소 관련 속성을 외부 프로세스가
 # 직접 읽을 때마다 "전자 메일 주소 정보에 액세스" 보안 경고를 띄운다.
 # Items.Restrict 필터는 보호 대상이 아니므로, 보낸 사람 판정은 필터로 처리한다.
@@ -275,7 +290,10 @@ def sender_matches(message, sender_names):
 
     message가 들어 있는 폴더에 보낸 사람+제목 필터를 걸고, 결과에 같은 EntryID가 있는지 봅니다.
     필터가 실패하면 SenderName 직접 비교로 대체합니다 (이 경우 보안 경고가 뜰 수 있음).
+    Graph 메일은 보낸 사람 이름을 바로 본다 — 보안 경고가 없다.
     """
+    if is_graph(message):
+        return message.SenderName in sender_names
     try:
         entry_id = message.EntryID
         items = message.Parent.Items.Restrict(
@@ -289,6 +307,18 @@ def sender_matches(message, sender_names):
         except Exception as e2:
             logging.error(f"SenderName 확인 실패: {e2}")
             return False
+
+
+def inbox_items(outlook, sender_names, subject_like=None, since=None):
+    """받은편지함에서 sender_names 가 보낸 메일(제목에 subject_like 가 들어간 것만 — 주면).
+    클래식은 Restrict 필터(since 는 부른 쪽이 거른다), Graph 는 graph_mail 이 since 부터 받아 온다."""
+    if is_graph(outlook):
+        return outlook.inbox_messages(sender_names, subject_like, since)
+    query = build_sender_filter(sender_names)
+    if subject_like is not None:
+        query += f" AND {_DASL_SUBJECT} LIKE {_dasl_str('%' + subject_like + '%')}"
+    # 수정 #2: list()로 스냅샷을 찍어 순회 중 Items 변경으로 인한 누락/중복 방지
+    return list(outlook.GetDefaultFolder(6).Items.Restrict(query))
 
 
 def _extract_message_info(message):
@@ -371,12 +401,10 @@ def save_attachments(outlook):
     """받은 편지함의 위임 메일 첨부파일을 저장합니다.
 
     Args:
-        outlook: Outlook MAPI 네임스페이스 인스턴스 (개선 #8: 전역 변수 대신 인자로 전달)
+        outlook: Outlook MAPI 네임스페이스 인스턴스 또는 graph_mail.GraphMailbox (개선 #8: 전역 변수 대신 인자로 전달)
     """
-    inbox = outlook.GetDefaultFolder(6)
     # SenderName을 직접 읽으면 Outlook 보안 경고가 뜨므로 Restrict 필터로 보낸 사람을 거른다.
-    # 수정 #2: list()로 스냅샷을 찍어 순회 중 Items 변경으로 인한 누락/중복 방지
-    messages = list(inbox.Items.Restrict(build_sender_filter(DELEGATION_SENDERS)))
+    messages = inbox_items(outlook, DELEGATION_SENDERS)
     attach_list = []
 
     for message in messages:
@@ -555,7 +583,9 @@ def instruction_senders():
 
 
 def in_inbox(message, outlook) -> bool:
-    """처리하는 지금 받은편지함에 있는가 — 받은편지함만 본다(사용자 10-24)."""
+    """처리하는 지금 받은편지함에 있는가 — 받은편지함만 본다(사용자 10-24). Graph 는 받은편지함에서만 받아 온다."""
+    if is_graph(message):
+        return True
     try:
         return message.Parent.EntryID == outlook.GetDefaultFolder(6).EntryID
     except Exception:                                   # noqa: BLE001
@@ -574,7 +604,8 @@ def instruction_ref(message, outlook) -> str:
 
 def record_instruction(message, ref, session, tray=None):
     """고른 메일 하나 — 저장·적기. 연장 낱말이면 트레이에 「기연 지시일 수 있음」(tray 가 있을 때)."""
-    got = instruction_mail.handle(message, ref, DATA_DIR, instruction_senders()[0], session=session)
+    got = instruction_mail.handle(message, ref, DATA_DIR, instruction_senders()[0], session=session,
+                                  source="graph" if is_graph(message) else "outlook")
     if got and got["alert"] and tray is not None:
         tray.showMessage("기연 지시일 수 있음 — %s" % (ref or "Ref 모름"), message.Subject or "",
                          qtw.QSystemTrayIcon.MessageIcon.Information, 20000)
@@ -583,10 +614,9 @@ def record_instruction(message, ref, session, tray=None):
 
 def scan_instructions(outlook, days=INSTRUCTION_SCAN_DAYS):
     """켤 때 — 받은편지함 최근 days 일의 받은 지시(꺼져 있던 동안 이미 다른 폴더로 옮긴 메일은 못 본다)."""
-    inbox = outlook.GetDefaultFolder(6)
     since = date.today() - timedelta(days=days)
     found = 0
-    for message in list(inbox.Items.Restrict(build_sender_filter(instruction_senders()))):
+    for message in inbox_items(outlook, instruction_senders(), since=since):
         try:
             if instruction_mail.received_of(message).date() < since:
                 continue
@@ -604,13 +634,9 @@ def scan_prenotices(outlook, days=PRENOTICE_SCAN_DAYS):
 
     확인을 마치고 다른 폴더로 옮긴 예고 메일은 보지 않습니다.
     """
-    inbox = outlook.GetDefaultFolder(6)
-    query = (
-        build_sender_filter(PRENOTICE_SENDERS)
-        + f" AND {_DASL_SUBJECT} LIKE {_dasl_str('%' + PRENOTICE_SUBJECT + '%')}"
-    )
     since = date.today() - timedelta(days=days)
-    messages = [m for m in inbox.Items.Restrict(query) if m.CreationTime.date() >= since]
+    messages = [m for m in inbox_items(outlook, PRENOTICE_SENDERS, PRENOTICE_SUBJECT, since)
+                if m.CreationTime.date() >= since]
     for message in sorted(messages, key=lambda m: m.CreationTime):  # 오래된 것부터
         try:
             handle_prenotice(message)
@@ -1280,14 +1306,10 @@ def scan_delegations(outlook, days=DELEGATION_SCAN_DAYS):
 
     처음 실행할 때(등록 기록 파일 없음)는 이미 등록했을 수 있으니 지금 있는 메일을 처리한 것으로만 기록합니다.
     """
-    inbox = outlook.GetDefaultFolder(6)
-    query = (
-        build_sender_filter(CALENDAR_SENDERS)
-        + f" AND {_DASL_SUBJECT} LIKE {_dasl_str('%위임%')}"
-    )
     since = date.today() - timedelta(days=days)
     messages = sorted(
-        (m for m in inbox.Items.Restrict(query) if m.CreationTime.date() >= since and is_calendar_delegation(m)),
+        (m for m in inbox_items(outlook, CALENDAR_SENDERS, "위임", since)
+         if m.CreationTime.date() >= since and is_calendar_delegation(m)),
         key=lambda m: m.CreationTime,
     )
     # 받은 위임은 일정 등록 기록과 따로 — 처음 실행·이미 처리한 메일도 NAS 에 없으면 쓴다 (한 번에 붙는다)
@@ -1349,10 +1371,11 @@ def catch_up_calendar(outlook):
         rows += retry_pending(naver_cal.Session())
     except Exception as e:
         logging.error(f"실패 일정 다시 등록 실패: {e}", exc_info=True)
-    try:
-        rows += scan_delegations(outlook)
-    except Exception as e:
-        logging.error(f"위임 메일 스캔 실패: {e}", exc_info=True)
+    if outlook is not None:  # 메일함을 못 열었으면(로그인 필요 등) 실패 일정만 다시
+        try:
+            rows += scan_delegations(outlook)
+        except Exception as e:
+            logging.error(f"위임 메일 스캔 실패: {e}", exc_info=True)
     if any(status != STATUS_DUPLICATE for *_x, status in rows):
         StartupSummaryDialog(rows, qtw.QApplication.activeWindow()).exec()
     return rows
@@ -1440,6 +1463,46 @@ class DeadlineRunner(qtc.QObject):
         self.tray_icon.showMessage(title, text, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
 
 
+def on_new_message(message, session):
+    """새 메일 한 통 — 클래식 Outlook 의 OnNewMailEx 와 Graph 감시(GraphWatcher)가 함께 부른다.
+    session: 클래식은 MAPI 네임스페이스, Graph 는 graph_mail.GraphMailbox."""
+    main_win = Handler_Class.main_win
+    # 보낸 사람 판정(sender_matches)은 비용이 있으므로 제목/첨부 조건을 먼저 확인
+    if (
+        ("위임" in message.Subject)
+        and (message.Attachments.Count != 0)
+        and sender_matches(message, DELEGATION_SENDERS)
+    ):
+        # 수정 #1: attach_list를 넘겨 저장 결과를 받고 QTableWidget에 항목 추가
+        new_items = []
+        _save_attachments_for_message(message, new_items)
+        if main_win is not None and new_items:
+            for item in new_items:
+                main_win.add_table_row(*item)
+
+    # 예고 메일(사건 담당자 지정): 출원번호·KIPRIS 마감기한을 Ref 별로 저장해 둔다
+    if is_prenotice(message):
+        try:
+            handle_prenotice(message)
+        except Exception as e:
+            logging.error(f"예고 메일 처리 실패: {e}", exc_info=True)
+        return
+
+    if is_calendar_delegation(message):
+        try:
+            register_delegation(message)
+        except Exception as e:
+            logging.error(f"위임 메일 일정 등록 실패: {message.Subject} — {e}", exc_info=True)
+
+    # 받은 지시(고객 지시 메일) — 받은편지함의 대표 메일함 전달분만 .msg 로 두고 NAS 에 적는다
+    try:
+        ref = instruction_ref(message, session)
+        if ref:
+            record_instruction(message, ref, session, getattr(main_win, "tray_icon", None))
+    except Exception as e:
+        logging.error(f"받은 지시 처리 실패: {message.Subject} — {e}", exc_info=True)
+
+
 # 개선 #6: Python 3에서 (object) 상속 명시는 불필요
 class Handler_Class:
     # 개선 #8: outlook 인스턴스를 클래스 변수로 관리 (DispatchWithEvents 특성상 생성자 인자 전달 불가)
@@ -1448,44 +1511,92 @@ class Handler_Class:
 
     def OnNewMailEx(self, receivedItemsIDs):
         # receivedItemsIDs는 ","로 구분된 메일 ID 모음입니다.
+        session = Handler_Class.outlook.Session
         for ID in receivedItemsIDs.split(","):
-            message = Handler_Class.outlook.Session.GetItemFromID(ID)
+            on_new_message(session.GetItemFromID(ID), session)
 
-            # 보낸 사람 판정(sender_matches)은 비용이 있으므로 제목/첨부 조건을 먼저 확인
-            if (
-                ("위임" in message.Subject)
-                and (message.Attachments.Count != 0)
-                and sender_matches(message, DELEGATION_SENDERS)
-            ):
-                # 수정 #1: attach_list를 넘겨 저장 결과를 받고 QTableWidget에 항목 추가
-                new_items = []
-                _save_attachments_for_message(message, new_items)
-                if Handler_Class.main_win is not None and new_items:
-                    for item in new_items:
-                        Handler_Class.main_win.add_table_row(*item)
 
-            # 예고 메일(사건 담당자 지정): 출원번호·KIPRIS 마감기한을 Ref 별로 저장해 둔다
-            if is_prenotice(message):
-                try:
-                    handle_prenotice(message)
-                except Exception as e:
-                    logging.error(f"예고 메일 처리 실패: {e}", exc_info=True)
-                continue
+class GraphWatcher(qtc.QObject):
+    """새 Outlook(Graph) — 1분마다 받은편지함에 새로 온 메일을 본다(클래식의 OnNewMailEx 자리).
+    받아 오기는 스레드에서, 처리(일정 창·트레이 알림)는 GUI 스레드에서."""
 
-            if is_calendar_delegation(message):
-                try:
-                    register_delegation(message)
-                except Exception as e:
-                    logging.error(f"위임 메일 일정 등록 실패: {message.Subject} — {e}", exc_info=True)
+    arrived = qtc.Signal(list)
 
-            # 받은 지시(고객 지시 메일) — 받은편지함의 대표 메일함 전달분만 .msg 로 두고 NAS 에 적는다
+    def __init__(self, mailbox, parent=None):
+        super().__init__(parent)
+        self.mailbox = mailbox
+        self._started = False
+        self._busy = threading.Lock()
+        self.arrived.connect(self._handle)
+        self.timer = qtc.QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(60_000)
+        qtc.QTimer.singleShot(0, self.tick)
+
+    def tick(self):
+        if not self._busy.acquire(blocking=False):
+            return
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            if not self._started:
+                self.mailbox.start_watch()     # 지금 받은편지함 상태만 받아 둔다 — 지난 메일은 시작 스캔이 처리했다
+                self._started = True
+                return
+            messages = self.mailbox.poll()
+            if messages:
+                self.arrived.emit(messages)
+        except Exception as e:
+            logging.error(f"Graph 새 메일 확인 실패: {e}")
+        finally:
+            self._busy.release()
+
+    def _handle(self, messages):
+        for message in messages:
             try:
-                ref = instruction_ref(message, Handler_Class.outlook.Session)
-                if ref:
-                    tray = getattr(Handler_Class.main_win, "tray_icon", None)
-                    record_instruction(message, ref, Handler_Class.outlook.Session, tray)
+                on_new_message(message, self.mailbox)
             except Exception as e:
-                logging.error(f"받은 지시 처리 실패: {message.Subject} — {e}", exc_info=True)
+                logging.error(f"새 메일 처리 실패: {message.Subject} — {e}", exc_info=True)
+
+
+class GraphLogin(qtc.QObject):
+    """설정 창 「Microsoft 로그인」 — 브라우저 로그인을 스레드에서 기다린다. 끝나면 done(성공, 글)."""
+
+    done = qtc.Signal(bool, str)
+
+    def start(self, client_id, tenant_id):
+        threading.Thread(target=self._run, args=(client_id, tenant_id), daemon=True).start()
+
+    def _run(self, client_id, tenant_id):
+        try:
+            user = graph_mail.Auth(client_id, tenant_id).login()
+            self.done.emit(True, user)
+        except Exception as e:
+            logging.error(f"Microsoft 로그인 실패: {e}")
+            self.done.emit(False, str(e))
+
+
+def open_mailbox():
+    """설정 mail_backend 대로 메일함을 연다 → (메일함 또는 None, 못 열었을 때 까닭).
+    클래식은 새 메일 이벤트(Handler_Class)도 여기서 붙인다. Graph 의 새 메일 감시는 창을 띄운 뒤 GraphWatcher 가."""
+    if config.get("mail_backend") == "graph":
+        try:
+            return graph_mail.open_mailbox(config), ""
+        except graph_mail.LoginRequired as e:
+            return None, f"{e} 설정 창 「메일」 에서 Microsoft 로그인을 하세요."
+        except Exception as e:
+            logging.error(f"Graph 메일함 열기 실패: {e}", exc_info=True)
+            return None, f"Graph 메일함을 열지 못했습니다: {e}"
+    try:
+        client = import_win32com()
+        # 개선 #8: outlook 인스턴스를 함수/클래스에 명시적으로 전달
+        outlook_mapi = client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        Handler_Class.outlook = client.DispatchWithEvents("Outlook.Application", Handler_Class)
+        return outlook_mapi, ""
+    except Exception as e:
+        logging.error(f"클래식 Outlook 열기 실패: {e}", exc_info=True)
+        return None, f"클래식 Outlook 을 열지 못했습니다 — 새 Outlook 이면 설정 창 「메일」 에서 Graph 로 바꾸세요. ({e})"
 
 
 class MainWin(qtw.QWidget):
@@ -1647,7 +1758,40 @@ class MainWin(qtw.QWidget):
                                  "KIPRIS 로 확인하고 일정을 옮깁니다. 알림은 트레이 말풍선과 네이버 알림 캘린더(비우면 안 씀)에."))
         settings_main_layout.addWidget(watch_frame)
 
-        # 3-4. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
+        # 3-4. 메일 — 클래식 Outlook(COM) / 새 Outlook(Microsoft Graph)
+        mail_frame, mail_box = section("메일")
+        mail_row = qtw.QHBoxLayout()
+        mail_row.setSpacing(10)
+        mail_row.addWidget(qtw.QLabel("읽는 곳"))
+        self.mail_backend_combo = qtw.QComboBox()
+        self.mail_backend_combo.addItem("클래식 Outlook", "outlook")
+        self.mail_backend_combo.addItem("새 Outlook (Microsoft Graph)", "graph")
+        self.mail_backend_combo.setCurrentIndex(max(0, self.mail_backend_combo.findData(config.get("mail_backend"))))
+        mail_row.addWidget(self.mail_backend_combo)
+        mail_row.addWidget(qtw.QLabel("Client ID"))
+        self.graph_client_edit = qtw.QLineEdit(config.get("graph_client_id", ""))
+        mail_row.addWidget(self.graph_client_edit, 1)
+        mail_row.addWidget(qtw.QLabel("Tenant ID"))
+        self.graph_tenant_edit = qtw.QLineEdit(config.get("graph_tenant_id", ""))
+        mail_row.addWidget(self.graph_tenant_edit, 1)
+        mail_box.addLayout(mail_row)
+        login_row = qtw.QHBoxLayout()
+        login_row.setSpacing(10)
+        self.graph_status = qtw.QLabel("로그인을 확인하지 않았습니다")
+        self.graph_status.setObjectName("settingsHint")
+        self.graph_login_btn = qtw.QPushButton("Microsoft 로그인")
+        self.graph_login_btn.setObjectName("secondaryButton")
+        self.graph_login_btn.clicked.connect(self.graph_login_clicked)
+        login_row.addWidget(self.graph_status, 1)
+        login_row.addWidget(self.graph_login_btn)
+        mail_box.addLayout(login_row)
+        mail_box.addWidget(hint("새 Outlook 은 COM 을 지원하지 않아 Microsoft Graph 로 받은편지함을 읽습니다(읽기만). "
+                                "Client ID·Tenant ID 는 Entra 「TaskManager」 앱의 값. 읽는 곳을 바꾸면 앱을 다시 켜야 합니다."))
+        self.graph_login = GraphLogin(self)
+        self.graph_login.done.connect(self._graph_login_done)
+        settings_main_layout.addWidget(mail_frame)
+
+        # 3-5. 출원인 약칭표 — 일정 제목 끝에 붙일 약칭 (표에 없으면 자동으로 줄인다)
         abbr_frame, abbr_box = section("출원인 약칭")
         toolbar = qtw.QHBoxLayout()
         self.abbr_search = qtw.QLineEdit()
@@ -1896,11 +2040,31 @@ class MainWin(qtw.QWidget):
         self.filter_abbr_rows(self.abbr_search.text())
         config["alert_calendar"] = squash(self.alert_calendar_edit.text())
         config["deadline_times"] = {kind: edit.time().toString("HH:mm") for kind, edit in self.time_edits.items()}
+        backend = self.mail_backend_combo.currentData()
+        restart = backend != config.get("mail_backend", "outlook")
+        config["mail_backend"] = backend
+        config["graph_client_id"] = self.graph_client_edit.text().strip()
+        config["graph_tenant_id"] = self.graph_tenant_edit.text().strip()
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
                      f"담당자: {config['calendar_assignees']}, 약칭 {len(config['applicant_abbr'])}개, "
-                     f"알림 캘린더: {config['alert_calendar'] or '(없음)'}, 확인 시각: {config['deadline_times']}")
-        qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다.")
+                     f"알림 캘린더: {config['alert_calendar'] or '(없음)'}, 확인 시각: {config['deadline_times']}, "
+                     f"메일: {config['mail_backend']}")
+        qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다."
+                                    + ("\n메일 읽는 곳을 바꿨습니다 — 앱을 다시 켜면 적용됩니다." if restart else ""))
+
+    def graph_login_clicked(self):
+        """브라우저로 Microsoft 로그인(MFA 포함) — 토큰은 이 PC 에 암호화해 둔다. 입력한 ID 로 한다(저장 전이어도)."""
+        self.graph_login_btn.setEnabled(False)
+        self.graph_status.setText("브라우저에서 로그인하세요…")
+        self.graph_status.setStyleSheet("")
+        self.graph_login.start(self.graph_client_edit.text().strip(), self.graph_tenant_edit.text().strip())
+
+    def _graph_login_done(self, ok, text):
+        self.graph_login_btn.setEnabled(True)
+        self.graph_status.setText(f"로그인됨: {text} — 앱을 다시 켜면 적용" if ok else f"로그인 실패: {text}")
+        self.graph_status.setStyleSheet("color: #1E6B3A;" if ok else "color: #C0392B;")
+        logging.info(f"Microsoft 로그인: {'성공 ' + text if ok else '실패 — ' + text}")
 
     def test_db_clicked(self):
         qtw.QApplication.setOverrideCursor(qtc.Qt.CursorShape.WaitCursor)
@@ -2124,22 +2288,22 @@ class MainWin(qtw.QWidget):
 
 
 if __name__ == "__main__":
-    # 개선 #8: outlook 인스턴스를 함수/클래스에 명시적으로 전달
-    outlook_mapi = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    outlook_new = win32com.client.DispatchWithEvents(
-        "Outlook.Application", Handler_Class
-    )
-    Handler_Class.outlook = outlook_new  # 클래스 변수로 주입
-
-    attach_list = save_attachments(outlook_mapi)
-    try:
-        scan_prenotices(outlook_mapi)
-    except Exception as e:
-        logging.error(f"예고 메일 스캔 실패: {e}", exc_info=True)
-    try:
-        scan_instructions(outlook_mapi)
-    except Exception as e:
-        logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
+    # 메일함 — 클래식 Outlook(COM) 또는 새 Outlook(Graph). 못 열면 메일 기능만 끄고 앱은 뜬다
+    mailbox, mail_error = open_mailbox()
+    attach_list = []
+    if mailbox is not None:
+        try:
+            attach_list = save_attachments(mailbox)
+        except Exception as e:
+            logging.error(f"위임 첨부 스캔 실패: {e}", exc_info=True)
+        try:
+            scan_prenotices(mailbox)
+        except Exception as e:
+            logging.error(f"예고 메일 스캔 실패: {e}", exc_info=True)
+        try:
+            scan_instructions(mailbox)
+        except Exception as e:
+            logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
     app = qtw.QApplication(sys.argv)
     setup_app_fonts(app)
 
@@ -2319,7 +2483,11 @@ if __name__ == "__main__":
     mw = MainWin(attach_list)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     # 창을 띄운 뒤: 실패했던 일정 다시 등록 + 꺼져 있던 동안 온 위임 메일 일정 등록 (예고 메일 스캔 다음)
-    qtc.QTimer.singleShot(0, lambda: catch_up_calendar(outlook_mapi))
+    qtc.QTimer.singleShot(0, lambda: catch_up_calendar(mailbox))
+    graph_watcher = GraphWatcher(mailbox, mw) if is_graph(mailbox) else None
+    if mail_error:
+        logging.error(mail_error)
+        mw.tray_icon.showMessage("메일을 읽지 못합니다", mail_error, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
     # 기한 확인: 1분마다 시각을 보고, 켤 때 놓친 확인은 곧바로 따라잡는다
     deadline_runner = DeadlineRunner(mw.tray_icon, mw)
     qtc.QTimer.singleShot(5_000, deadline_runner.tick)
