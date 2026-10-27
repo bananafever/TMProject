@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -63,6 +65,35 @@ class Document:
 
 # ── 키 ───────────────────────────────────────────────────────────────
 
+_MAC_SERVICE = "ChekPat"
+_MAC_ACCOUNT = "credentials"
+
+
+def _mac_credentials() -> Optional[dict]:
+    """맥 키체인에서 ChekPat 자격증명 JSON 읽기."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import keyring
+        text = keyring.get_password(_MAC_SERVICE, _MAC_ACCOUNT)
+        if text:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    try:
+        done = subprocess.run(
+            ["security", "find-generic-password", "-s", _MAC_SERVICE, "-a", _MAC_ACCOUNT, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if done.returncode == 0 and done.stdout.strip():
+            data = json.loads(done.stdout.strip())
+            return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    return None
+
+
 def _chekpat_dir() -> Path:
     base = os.getenv("APPDATA")
     return Path(base) / "ChekPat" if base else Path.home() / ".chekpat"
@@ -72,6 +103,20 @@ def _unprotect(data: bytes) -> bytes:
     import win32crypt
     _desc, raw = win32crypt.CryptUnprotectData(data, _ENTROPY, None, None, 0)
     return raw
+
+
+def chekpat_credentials() -> Optional[dict]:
+    """ChekPat 자격증명 딕셔너리. 맥은 키체인, 윈도는 credentials.dat (DPAPI)."""
+    if sys.platform == "darwin":
+        data = _mac_credentials()
+        if data is not None:
+            return data
+    try:
+        raw = _unprotect((_chekpat_dir() / "credentials.dat").read_bytes())
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def api_key() -> str:
@@ -84,11 +129,10 @@ def api_key() -> str:
         return _unprotect((d / "kipris_key.dat").read_bytes()).decode("utf-8").strip()
     except Exception:
         pass
-    try:
-        values = json.loads(_unprotect((d / "credentials.dat").read_bytes()).decode("utf-8"))
+    values = chekpat_credentials()
+    if values and isinstance(values, dict):
         return (values.get("KIPRIS_API_KEY") or "").strip()
-    except Exception:
-        return ""
+    return ""
 
 
 # ── 호출 수 (NAS 공유 셈 + ChekPat settings.json 사본) ────────────────

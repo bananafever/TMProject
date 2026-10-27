@@ -108,6 +108,11 @@ class TestRecord(unittest.TestCase):
         with patch.object(db.kipris, "_unprotect", side_effect=OSError):
             self.assertIsNone(db.credentials())
 
+    def test_credentials_from_mac_keychain(self):
+        fake_mac_cred = {"DB_HOST": "mac.nas.local", "DB_PORT": "3307", "DB_USERNAME": "mac_u", "DB_PASSWORD": "mac_p"}
+        with patch.object(db.kipris, "_mac_credentials", return_value=fake_mac_cred):
+            self.assertEqual(db.credentials(), {"host": "mac.nas.local", "port": 3307, "user": "mac_u", "password": "mac_p"})
+
     def test_tests_never_see_real_credentials(self):
         """시험은 실제 ChekPat 접속 정보를 읽지 않는다 — 윈도에서 시험이 NAS 에 받은 위임을 썼다(2026-10-24)."""
         self.assertTrue(str(db.kipris._chekpat_dir()).startswith(os.environ["APPDATA"]))

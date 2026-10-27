@@ -57,6 +57,8 @@ except ImportError:
 from dateutil.relativedelta import relativedelta  # noqa: E402
 
 import kipris  # noqa: E402
+# 실제 맥 키체인도 시험 중에는 읽지 않는다
+kipris._mac_credentials = lambda: None
 import naver_cal  # noqa: E402
 import naver_sync  # noqa: E402
 import main  # noqa: E402  (mock 설정 후 import)

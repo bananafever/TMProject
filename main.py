@@ -27,7 +27,57 @@ import naver_cal
 # ── 데이터 폴더 ─────────────────────────────────────────────────────
 # settings.json(경로·약칭표·담당자)·case_cache.json·calendar_state.json·app.log 를 한 곳에 둔다.
 # exe 는 시작 프로그램 바로가기로 이 폴더에서 실행된다 — 소스로 실행해도 같은 파일을 쓴다.
-DEFAULT_DATA_DIR = r"G:/내 드라이브/bananafever/5_APPS/TaskManager"
+def find_mac_gdrive_base() -> str | None:
+    cloud_storage = os.path.expanduser("~/Library/CloudStorage")
+    if os.path.isdir(cloud_storage):
+        for entry in os.listdir(cloud_storage):
+            if entry.startswith("GoogleDrive"):
+                for my_drive in ("내 드라이브", "My Drive"):
+                    cand = os.path.join(cloud_storage, entry, my_drive)
+                    if os.path.isdir(cand):
+                        return cand
+    return None
+
+
+def find_mac_gdrive_data_dir() -> str | None:
+    base = find_mac_gdrive_base()
+    if base:
+        cand = os.path.join(base, "bananafever", "5_APPS", "TaskManager")
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def default_data_dir() -> str:
+    if sys.platform == "darwin":
+        mac_g = find_mac_gdrive_data_dir()
+        if mac_g:
+            return mac_g
+    return r"G:/내 드라이브/bananafever/5_APPS/TaskManager"
+
+
+DEFAULT_DATA_DIR = default_data_dir()
+
+
+def resolve_path(p: str) -> str:
+    """Windows 드라이브 경로(C:/Dropbox, G:/내 드라이브)를 macOS 클라우드 스토리지 경로로 자동 변환한다."""
+    if not p or sys.platform != "darwin" or os.path.exists(p):
+        return p
+    for prefix in ("C:/Dropbox", "C:\\Dropbox", "C:/dropbox", "C:\\dropbox"):
+        if p.startswith(prefix):
+            for db_cand in (os.path.expanduser("~/Library/CloudStorage/Dropbox"), os.path.expanduser("~/Dropbox")):
+                if os.path.isdir(db_cand):
+                    cand = os.path.join(db_cand, p[len(prefix):].lstrip("/\\"))
+                    if os.path.exists(cand):
+                        return cand
+    for prefix in ("G:/내 드라이브", "G:\\내 드라이브", "G:/My Drive", "G:\\My Drive"):
+        if p.startswith(prefix):
+            gbase = find_mac_gdrive_base()
+            if gbase:
+                cand = os.path.join(gbase, p[len(prefix):].lstrip("/\\"))
+                if os.path.exists(cand):
+                    return cand
+    return p
 
 
 def data_dir():
@@ -36,6 +86,12 @@ def data_dir():
     if env:
         return env
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin" and "Contents/MacOS" in getattr(sys, "executable", ""):
+            if os.path.isdir(DEFAULT_DATA_DIR):
+                return DEFAULT_DATA_DIR
+            app_support = os.path.expanduser("~/Library/Application Support/TaskManager")
+            os.makedirs(app_support, exist_ok=True)
+            return app_support
         return os.path.dirname(sys.executable)
     if os.path.isdir(DEFAULT_DATA_DIR):
         return DEFAULT_DATA_DIR
@@ -182,6 +238,30 @@ def use_app_font(*widgets):
     font = qtw.QApplication.font()
     for widget in widgets:
         widget.setFont(font)
+
+
+def ensure_icon_assets():
+    """드랍다운 등 앱 전역에서 사용하는 벡터 SVG 아이콘을 생성/확인합니다."""
+    icon_dir = resource_path(os.path.join("assets", "icons"))
+    os.makedirs(icon_dir, exist_ok=True)
+    icons = {
+        "chevron-down.svg": "#64748B",
+        "chevron-down-hover.svg": "#26695E",
+        "chevron-down-disabled.svg": "#94A3B8",
+    }
+    for filename, color in icons.items():
+        filepath = os.path.join(icon_dir, filename)
+        if not os.path.exists(filepath):
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+                f'fill="none" stroke="{color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+                f'<polyline points="6 9 12 15 18 9"></polyline></svg>'
+            )
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(svg)
+            except Exception:
+                pass
 
 
 def create_dir_if_not_exists(directory):
@@ -360,7 +440,7 @@ def transfer_name(date_folder, time_id, ref_num, name):
 def already_transferred(delivery_date, time_id, ref_num, name):
     """이미 옮긴 검수 첨부인가 — 옮긴 뒤에도 메일이 받은편지함에 남아 있으면 켤 때마다 다시 내려받았다(10-24).
     target_path 가 없거나 닿지 않으면 False(지금 동작 그대로)."""
-    target = config.get("target_path", "")
+    target = resolve_path(config.get("target_path", ""))
     return bool(target) and os.path.isdir(os.path.join(target, transfer_name(delivery_date, time_id, ref_num, name)))
 
 
@@ -380,7 +460,7 @@ def _save_attachments_for_message(message, attach_list=None):
             attach_list.append((f"{delivery_date} {time_str}", ref_num, name, "Already Transferred"))
         return
 
-    date_folder = os.path.join(config["parent_path"], delivery_date)
+    date_folder = os.path.join(resolve_path(config["parent_path"]), delivery_date)
     create_dir_if_not_exists(date_folder)
     task_folder = os.path.join(date_folder, time_id + "_" + ref_folder)
 
@@ -1668,6 +1748,8 @@ def search_mailbox():
     global _search_mailbox
     with _search_mailbox_lock:
         if _search_mailbox is None:
+            if not config.get("graph_client_id"):
+                load_config()
             _search_mailbox = graph_mail.open_mailbox(config)
         return _search_mailbox
 
@@ -1860,14 +1942,14 @@ class MainWin(qtw.QWidget):
         path_frame, path_box = section("파일 경로")
         settings_layout = qtw.QFormLayout()
 
-        self.parent_path_edit = qtw.QLineEdit(config["parent_path"])
+        self.parent_path_edit = qtw.QLineEdit(resolve_path(config.get("parent_path", "")))
         parent_btn = qtw.QPushButton("Browse...")
         parent_btn.clicked.connect(self.browse_parent)
         parent_box = qtw.QHBoxLayout()
         parent_box.addWidget(self.parent_path_edit)
         parent_box.addWidget(parent_btn)
 
-        self.target_path_edit = qtw.QLineEdit(config["target_path"])
+        self.target_path_edit = qtw.QLineEdit(resolve_path(config.get("target_path", "")))
         target_btn = qtw.QPushButton("Browse...")
         target_btn.clicked.connect(self.browse_target)
         target_box = qtw.QHBoxLayout()
@@ -1940,6 +2022,8 @@ class MainWin(qtw.QWidget):
         mail_row.setSpacing(10)
         mail_row.addWidget(qtw.QLabel("읽는 곳"))
         self.mail_backend_combo = qtw.QComboBox()
+        self.mail_backend_combo.setView(qtw.QListView())
+        self.mail_backend_combo.setMinimumWidth(220)
         self.mail_backend_combo.addItem("클래식 Outlook", "outlook")
         self.mail_backend_combo.addItem("새 Outlook (Microsoft Graph)", "graph")
         self.mail_backend_combo.setCurrentIndex(max(0, self.mail_backend_combo.findData(config.get("mail_backend"))))
@@ -2069,9 +2153,12 @@ class MainWin(qtw.QWidget):
         win_layout.setSpacing(0)
         win_layout.addLayout(content_row, 1)
 
-        quit_row = qtw.QHBoxLayout()
-        quit_row.setContentsMargins(18, 8, 18, 14)
-        quit_row.setSpacing(8)
+        # 하단 영역: 상단과 구분선을 둔 일체형 풋터 바 (안 2: macOS 소프트 필 스타일)
+        bottom_bar = qtw.QFrame()
+        bottom_bar.setObjectName("bottomBar")
+        quit_row = qtw.QHBoxLayout(bottom_bar)
+        quit_row.setContentsMargins(18, 10, 18, 12)
+        quit_row.setSpacing(10)
         # Settings 탭에서만: 안내 + 「설정 저장」 (Quit 과 같은 크기)
         self.save_hint = qtw.QLabel("변경 사항은 저장해야 적용됩니다")
         self.save_hint.setObjectName("settingsHint")
@@ -2086,7 +2173,7 @@ class MainWin(qtw.QWidget):
         quit_row.addStretch()
         quit_row.addWidget(self.save_btn)
         quit_row.addWidget(quit_btn)
-        win_layout.addLayout(quit_row)
+        win_layout.addWidget(bottom_bar)
         self.bottom_buttons = (self.save_btn, quit_btn)
 
         self.stack.currentChanged.connect(self._on_page_changed)
@@ -2105,14 +2192,14 @@ class MainWin(qtw.QWidget):
             screen_geometry.center().y() - self.height() // 2,
         )
 
-        # UI 개선 #4: 트레이 아이콘 더블클릭으로 창 표시
+        # UI 개선 #4: 트레이 아이콘 더블클릭/클릭으로 창 표시
         self.tray_icon = qtw.QSystemTrayIcon(qtg.QIcon(resource_path("icon.png")), self)
         menu = qtw.QMenu()
 
         action1 = menu.addAction("Show")
-        action1.triggered.connect(lambda: self.show())
+        action1.triggered.connect(self.show_and_activate)
         action2 = menu.addAction("Quit")
-        action2.triggered.connect(lambda: sys.exit())
+        action2.triggered.connect(self.quit_clicked)
 
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
@@ -2121,11 +2208,17 @@ class MainWin(qtw.QWidget):
         # UI 개선 #6: 레이아웃과 트레이 설정이 모두 끝난 후 show() 호출
         self.show()
 
+    def show_and_activate(self):
+        """창을 정상 크기로 복원하고 맨 앞으로 활성화합니다."""
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def _on_tray_activated(self, reason):
-        """트레이 아이콘 더블클릭 시 창을 표시합니다."""
-        if reason == qtw.QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.show()
-            self.activateWindow()
+        """트레이 아이콘 클릭 또는 더블클릭 시 창을 표시합니다."""
+        if reason in (qtw.QSystemTrayIcon.ActivationReason.DoubleClick, qtw.QSystemTrayIcon.ActivationReason.Trigger):
+            self.show_and_activate()
 
     def update_table(self, messages_data):
         """카드 목록을 모두 지우고 새 데이터를 추가합니다."""
@@ -2251,8 +2344,15 @@ class MainWin(qtw.QWidget):
         self.graph_login.start(*self.graph_ids)
 
     def _graph_login_done(self, ok, text):
+        global _search_mailbox
         self.graph_login_btn.setEnabled(True)
-        self.graph_status.setText(f"로그인됨: {text} — 앱을 다시 켜면 적용" if ok else f"로그인 실패: {text}")
+        if ok:
+            config["graph_client_id"], config["graph_tenant_id"] = self.graph_ids
+            config["mail_backend"] = "graph"
+            save_config()
+            with _search_mailbox_lock:
+                _search_mailbox = None
+        self.graph_status.setText(f"로그인됨: {text}" if ok else f"로그인 실패: {text}")
         self.graph_status.setStyleSheet("color: #1E6B3A;" if ok else "color: #C0392B;")
         logging.info(f"Microsoft 로그인: {'성공 ' + text if ok else '실패 — ' + text}")
 
@@ -2374,6 +2474,8 @@ class MainWin(qtw.QWidget):
                               "Entra 「TaskManager」 앱의 값. 「설정 저장」 을 눌러야 저장됩니다.", mono=True)
         if dialog.exec():
             self.graph_ids = dialog.values()
+            config["graph_client_id"], config["graph_tenant_id"] = self.graph_ids
+            save_config()
             self._show_graph_rows()
             self._show_graph_status()
 
@@ -2409,13 +2511,16 @@ class MainWin(qtw.QWidget):
         self._fit_abbr_column()
 
     def closeEvent(self, event):
+        if getattr(self, "_quitting", False):
+            event.accept()
+            return
         event.ignore()
         self.hide()
 
     def transfer_clicked(self):
         try:
-            p_path = config.get("parent_path", "")
-            t_path = config.get("target_path", "")
+            p_path = resolve_path(config.get("parent_path", ""))
+            t_path = resolve_path(config.get("target_path", ""))
             
             if not p_path or not os.path.exists(p_path):
                 qtw.QMessageBox.critical(self, "경로 오류", f"작업 경로(Parent Path)가 존재하지 않습니다:\n{p_path}")
@@ -2513,7 +2618,34 @@ class MainWin(qtw.QWidget):
             qtw.QMessageBox.critical(self, "오류 발생", f"파일 이전 중 오류가 발생했습니다:\n{e}")
 
     def quit_clicked(self):
-        sys.exit()
+        self._quitting = True
+        qtw.QApplication.quit()
+
+
+class _MacAppEvents(qtc.QObject):
+    """맥: ⌘Q(앱 종료 요청)면 창을 숨기지 말고 닫게 표시한다."""
+
+    def __init__(self, mw):
+        super().__init__(mw)
+        self.mw = mw
+
+    def eventFilter(self, obj, event):
+        if event.type() == qtc.QEvent.Type.Quit:
+            self.mw._quitting = True
+        return False
+
+
+def _setup_mac_app_events(app, mw) -> None:
+    """맥에서만 — 독 아이콘을 누르면 숨긴 창을 다시 띄우고, ⌘Q 는 앱을 끝낸다."""
+    if sys.platform != "darwin":
+        return
+    mw._mac_events = _MacAppEvents(mw)
+    app.installEventFilter(mw._mac_events)
+
+    def activated(state):
+        if state == qtc.Qt.ApplicationState.ApplicationActive and not mw.isVisible():
+            mw.show_and_activate()
+    app.applicationStateChanged.connect(activated)
 
 
 if __name__ == "__main__":
@@ -2534,6 +2666,11 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"받은 지시 스캔 실패: {e}", exc_info=True)
     app = qtw.QApplication(sys.argv)
+
+    ensure_icon_assets()
+    arrow_icon = resource_path(os.path.join("assets", "icons", "chevron-down.svg")).replace("\\", "/")
+    arrow_hover_icon = resource_path(os.path.join("assets", "icons", "chevron-down-hover.svg")).replace("\\", "/")
+    arrow_disabled_icon = resource_path(os.path.join("assets", "icons", "chevron-down-disabled.svg")).replace("\\", "/")
 
     # pdfProject Clean Light 테마 참고 (웜 뉴트럴 캔버스 + 틸/오렌지 액센트)
     app.setStyleSheet("""
@@ -2618,6 +2755,64 @@ if __name__ == "__main__":
         QTextEdit:focus, QLineEdit:focus {
             border: 1px solid #26695E;
         }
+        QComboBox {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 8px;
+            padding: 4px 28px 4px 10px;
+            color: #232220;
+            min-height: 22px;
+        }
+        QComboBox:hover {
+            border: 1px solid #B5C4BE;
+            background-color: #FAFBFB;
+        }
+        QComboBox:focus, QComboBox:on {
+            border: 1px solid #26695E;
+        }
+        QComboBox:disabled {
+            background-color: #F8FAFC;
+            color: #94A3B8;
+            border-color: #E2E8F0;
+        }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 24px;
+            border-left: none;
+            border-top-right-radius: 8px;
+            border-bottom-right-radius: 8px;
+        }
+        QComboBox::down-arrow {
+            image: url({arrow_icon});
+            width: 11px;
+            height: 11px;
+        }
+        QComboBox::down-arrow:hover, QComboBox::down-arrow:on {
+            image: url({arrow_hover_icon});
+        }
+        QComboBox::down-arrow:disabled {
+            image: url({arrow_disabled_icon});
+        }
+        QComboBox QAbstractItemView {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: #E1F5EE;
+            selection-color: #085041;
+            outline: none;
+        }
+        QComboBox QAbstractItemView::item {
+            min-height: 26px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            color: #232220;
+        }
+        QComboBox QAbstractItemView::item:selected {
+            background-color: #E1F5EE;
+            color: #085041;
+        }
         QGroupBox {
             font-weight: bold;
             border: 1px solid #DCE3DF;
@@ -2657,24 +2852,84 @@ if __name__ == "__main__":
         QPushButton#secondaryButton:hover {
             background-color: #E1F5EE;
         }
+        QPushButton#secondaryButton:disabled {
+            background-color: #F8FAFC;
+            color: #94A3B8;
+            border-color: #E2E8F0;
+        }
+        #searchFilterContainer {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 12px;
+        }
+        #searchFilterContainer QLabel {
+            background-color: transparent;
+        }
+        #searchStatus {
+            color: #64748B;
+            font-size: 9pt;
+            font-weight: 500;
+        }
+        #previewContainer {
+            background-color: white;
+            border: 1px solid #DCE3DF;
+            border-radius: 12px;
+        }
+        #previewContainer QLabel {
+            background-color: transparent;
+        }
+        #previewSubject {
+            font-size: 11.5pt;
+            font-weight: bold;
+            color: #0F172A;
+            line-height: 1.4;
+        }
+        #previewMeta {
+            color: #64748B;
+            font-size: 9pt;
+            line-height: 1.3;
+        }
+        #previewFiles {
+            background-color: #F1F5F9;
+            color: #1E293B;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 8.5pt;
+        }
+        QTextBrowser#previewBody {
+            background-color: white;
+            border: none;
+            border-top: 1px solid #F1F5F9;
+            padding: 8px 4px;
+            font-size: 9.5pt;
+        }
+        QSplitter::handle {
+            background-color: transparent;
+        }
         QTableWidget#abbrTable, QTableWidget#mailTable {
             background-color: white;
-            alternate-background-color: #F6F6F4;
+            alternate-background-color: #FAFBFB;
             border: 1px solid #DCE3DF;
-            border-radius: 8px;
+            border-radius: 10px;
             selection-background-color: #E1F5EE;
             selection-color: #085041;
         }
         QTableWidget#abbrTable::item, QTableWidget#mailTable::item {
-            padding: 0 8px;
+            padding: 0 4px;
         }
         QTableWidget#abbrTable QHeaderView::section, QTableWidget#mailTable QHeaderView::section {
-            background-color: #F1EFE8;
-            color: #5F5E5A;
+            background-color: #F8FAFC;
+            color: #475569;
             border: none;
-            border-bottom: 1px solid #D3D1C7;
+            border-bottom: 1px solid #E2E8F0;
             padding: 6px 8px;
             font-weight: bold;
+        }
+        /* Search 탭 목록 — 테두리·라운드는 RoundedFrame 이 그린다(표 자체 테두리를 겹치지 않게) */
+        QTableWidget#mailTable {
+            border: none;
+            border-radius: 0;
         }
         QScrollArea, #cardsContainer {
             background-color: transparent;
@@ -2714,38 +2969,49 @@ if __name__ == "__main__":
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
             background: none;
         }
+        #bottomBar {
+            background-color: #F6F6F4;
+            border: none;
+            border-top: 1px solid #DCE3DF;
+        }
         #quitButton {
-            background-color: white;
-            color: #993C1D;
-            border: 1px solid #F0997B;
-            border-radius: 10px;
-            font-weight: normal;
+            background-color: #ECEAE5;
+            color: #52525B;
+            border: none;
+            border-radius: 18px;
+            font-weight: 500;
+            padding: 0 16px;
         }
         #quitButton:hover {
-            background-color: #FAECE7;
+            background-color: #DFDDD7;
+            color: #18181B;
         }
         #quitButton:pressed {
-            background-color: #F5C4B3;
+            background-color: #D4D1C9;
+            color: #18181B;
         }
         QPushButton#saveButton {
-            background-color: #185FA5;
+            background-color: #26695E;
             color: white;
-            border: 1px solid #185FA5;
-            border-radius: 10px;
+            border: none;
+            border-radius: 18px;
+            font-weight: bold;
+            padding: 0 16px;
         }
         QPushButton#saveButton:hover {
-            background-color: #0C447C;
-            border-color: #0C447C;
+            background-color: #1F574E;
         }
         QPushButton#saveButton:pressed {
-            background-color: #042C53;
-            border-color: #042C53;
+            background-color: #17423B;
         }
-    """)
+    """.replace("{arrow_icon}", arrow_icon)
+       .replace("{arrow_hover_icon}", arrow_hover_icon)
+       .replace("{arrow_disabled_icon}", arrow_disabled_icon))
     setup_app_fonts(app)  # 스타일시트 뒤에 — 스타일시트를 입히면 클래스별 글꼴(메시지 상자)이 Windows 값으로 돌아간다
 
     app.setQuitOnLastWindowClosed(False)
     mw = MainWin(attach_list)
+    _setup_mac_app_events(app, mw)
     Handler_Class.main_win = mw  # UI 업데이트를 위한 MainWin 인스턴스 주입
     # 창을 띄운 뒤: 실패했던 일정 다시 등록 + 꺼져 있던 동안 온 위임 메일 일정 등록 (예고 메일 스캔 다음)
     qtc.QTimer.singleShot(0, lambda: catch_up_calendar(mailbox))

@@ -13,6 +13,7 @@ def build_exe():
     datas = [
         ("icon.png", "."),
         ("assets/fonts", "assets/fonts"),
+        ("assets/icons", "assets/icons"),
     ]
     
     # 숨겨진 임포트 (발견되지 않는 모듈 강제 포함)

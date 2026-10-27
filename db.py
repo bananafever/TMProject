@@ -36,11 +36,9 @@ class DbError(Exception):
 # ── 접속 ─────────────────────────────────────────────────────────────
 
 def credentials() -> Optional[Dict[str, str]]:
-    """ChekPat credentials.dat → {host, port, user, password}. 없거나 비었으면 None."""
-    try:
-        raw = kipris._unprotect((kipris._chekpat_dir() / "credentials.dat").read_bytes())
-        values = json.loads(raw.decode("utf-8"))
-    except Exception:
+    """ChekPat 자격증명(윈도 credentials.dat / 맥 키체인) → {host, port, user, password}. 없거나 비었으면 None."""
+    values = kipris.chekpat_credentials()
+    if not values or not isinstance(values, dict):
         return None
     host = str(values.get("DB_HOST") or "").strip()
     user = str(values.get("DB_USERNAME") or "").strip()
