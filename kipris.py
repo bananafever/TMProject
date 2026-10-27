@@ -5,7 +5,9 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
 
 - 키: ChekPat 과 같은 키를 쓴다. 환경변수 `KIPRIS_API_KEY` → %APPDATA%\\ChekPat\\kipris_key.dat
   → %APPDATA%\\ChekPat\\credentials.dat 의 `KIPRIS_API_KEY` 순서. 두 파일은 DPAPI 로 봉인되어 있다.
-- 호출 수: 무료 월 1,000회가 키 단위라 ChekPat 의 settings.json `kipris_calls` 를 같이 센다(상한 900).
+- 호출 수: 무료 월 1,000회가 키 단위라 NAS `iplog.kipris_usage`(키의 SHA-256 앞 16자 × 달)에 ChekPat(윈도·맥)과 같이 센다
+  (상한 900, 10-27). NAS 에 닿지 않으면 ChekPat 의 settings.json `kipris_calls` 로 잇고, 닿을 때 못 올린 만큼 올린다
+  (`kipris_reported`). ChekPat `app/modules/patent/kipris_usage.py` 와 같은 표·같은 규칙이다 — 바꾸면 양쪽을 함께.
 - 응답 필드: `Mailingnumber`(발송번호)·`DocNm`(서류명)·`ExpirationDuedateDate`(연장 반영 마감기한).
 - 「특허·실용 서지 상세」(`/kipo-api/kipi/` 게이트, 키는 `ServiceKey`)로 거절결정이 재심사에 의한 것인지 가린다
   — `finalDisposal`(「거절결정(일반)」·「거절결정(재심사)」)과 서류 목록(「…보정서(재심사)」).
@@ -13,6 +15,7 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
   낸 날 바로 「접수중」 으로 실리고, 마감기한(`ExpirationDuedateDate`)은 「수리」 뒤에야 늘어난다(10-24 확인).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -88,12 +91,61 @@ def api_key() -> str:
         return ""
 
 
-# ── 호출 수 (ChekPat settings.json 공유) ──────────────────────────────
+# ── 호출 수 (NAS 공유 셈 + ChekPat settings.json 사본) ────────────────
 _count_lock = threading.Lock()
 
 
+def key_id(key: str) -> str:
+    """키의 SHA-256 앞 16자 — NAS 에는 키 자체를 올리지 않는다 (ChekPat `kipris_usage.key_id` 와 같다)."""
+    return hashlib.sha256((key or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+class _Full(Exception):
+    def __init__(self, total: int):
+        self.total = total
+        super().__init__(str(total))
+
+
+_known_total: Dict[tuple, int] = {}      # (key_id, 달) → 마지막으로 본 공유 값
+
+
+def _shared_charge(key: str, month: str, delta: int, cap: int) -> Optional[int]:
+    """NAS 공유 셈에 `delta` 를 더한다. 이미 cap 이상이면 `_Full`. 닿지 않거나 표가 없으면 None."""
+    import db                                       # db 가 kipris 를 들이므로 여기서
+    kid = key_id(key)
+    try:
+        conn = db.connect()
+    except db.DbError:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT IGNORE INTO kipris_usage (ym, key_id, calls) VALUES (%s, %s, 0)", (month, kid))
+            cur.execute("UPDATE kipris_usage SET calls = calls + %s WHERE ym = %s AND key_id = %s AND calls < %s",
+                        (int(delta), month, kid, int(cap)))
+            added = cur.rowcount
+            cur.execute("SELECT calls FROM kipris_usage WHERE ym = %s AND key_id = %s", (month, kid))
+            total = int(list(cur.fetchone().values())[0])
+        conn.commit()
+    except Exception as e:                          # 표 없음·쓰기 거부·네트워크 — 이 PC 셈으로 잇는다
+        logging.warning(f"KIPRIS 공유 셈 쓰기 실패: {type(e).__name__}: {e}")
+        db._last_fail = time.monotonic()            # 한동안 다시 붙어 보지 않는다
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _known_total[(kid, month)] = total
+    if not added:
+        raise _Full(total)
+    return total
+
+
 def _count_call(today: Optional[date] = None) -> None:
-    """한 번 보낸다고 적는다. 이번 달 상한이면 보내기 전에 막는다."""
+    """한 번 보낸다고 적는다. 이번 달 상한이면 보내기 전에 막는다.
+
+    NAS 공유 셈에 먼저 더하고, ChekPat settings.json 의 이 PC 셈(`kipris_calls`)도 늘 함께 적는다.
+    `kipris_reported` 는 그 가운데 공유 셈에 이미 올린 만큼 — NAS 에 못 닿은 사이의 호출은 다음에 닿을 때 올린다."""
     path = _chekpat_dir() / "settings.json"
     month = (today or date.today()).strftime("%Y-%m")
     with _count_lock:
@@ -104,12 +156,27 @@ def _count_call(today: Optional[date] = None) -> None:
             settings = {}
         calls = settings.get("kipris_calls")
         calls = dict(calls) if isinstance(calls, dict) else {}
-        used = int(calls.get(month, 0))
-        if used >= MONTHLY_CAP:
-            raise KiprisError("이번 달 KIPRIS 호출이 상한에 닿았습니다 (%d/%d)." % (used, MONTHLY_CAP))
+        reported = settings.get("kipris_reported")
+        reported = dict(reported) if isinstance(reported, dict) else {}
+        own = int(calls.get(month, 0))
+        pending = max(0, own - int(reported.get(month, 0)))
+        key = api_key()
+        shared = None
+        if key:
+            try:
+                shared = _shared_charge(key, month, pending + 1, MONTHLY_CAP)
+            except _Full as e:
+                raise KiprisError("이번 달 KIPRIS 호출이 상한에 닿았습니다 (%d/%d)." % (e.total, MONTHLY_CAP))
+        if shared is None:
+            base = _known_total.get((key_id(key), month)) if key else None
+            used = own if base is None else base + pending
+            if used >= MONTHLY_CAP:
+                raise KiprisError("이번 달 KIPRIS 호출이 상한에 닿았습니다 (%d/%d)." % (used, MONTHLY_CAP))
         # 지난 달 기록은 석 달치만 남긴다 (ChekPat 과 같은 규칙)
         keep = sorted(k for k in calls if k != month)[-2:]
-        settings["kipris_calls"] = {**{k: calls[k] for k in keep}, month: used + 1}
+        settings["kipris_calls"] = {**{k: calls[k] for k in keep}, month: own + 1}
+        if shared is not None:
+            settings["kipris_reported"] = {**{k: reported[k] for k in keep if k in reported}, month: own + 1}
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
