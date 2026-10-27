@@ -157,12 +157,14 @@ class TestAssignmentRow(unittest.TestCase):
             "due_date": "2027-02-08", "reexam": None, "received_at": "2026-10-16 14:05:00"})
         self.assertEqual(set(row), set(db.ASSIGNMENT_COLUMNS))
 
-    def test_fr_row_reexam_and_no_due(self):
+    def test_fr_row_reexam_and_due_from_receipt(self):
         cache = {"PA-2T9001|거절결정서": {"doc_type": "거절결정서", "receipt_date": "2026-10-06", "reexam": True,
                                        "app_no": "10-2024-0000001", "due_date": ""}}
         row = main.assignment_row(self._message(FR_SUBJECT), cache)
         self.assertEqual((row["doc_type"], row["reexam"], row["due_date"], row["report_due"], row["assigner"]),
-                         ("거절결정서", 1, None, "2026-10-05", "이여름"))
+                         ("거절결정서", 1, "2027-01-06", "2026-10-05", "이여름"))
+        row_no_cache = main.assignment_row(self._message(FR_SUBJECT), {})
+        self.assertEqual(row_no_cache["due_date"], "2027-01-16")
 
     def test_stale_case_and_no_cache(self):
         cache = {"PA-2T8084|의견제출통지서": {"doc_type": "의견제출통지서", "receipt_date": "2026-03-02",

@@ -1227,6 +1227,16 @@ def assignment_row(message, cache):
     doc = _DOC_BEFORE_SEO.search(subject) or _DOC_NAMED.search(subject)
     names = name_key.findall(subject)
     reexam = case.get("reexam") if rejection_type == "FR" else None
+    if rejection_type == "OA":
+        due_date = _valid_iso(case.get("due_date"))
+    elif rejection_type == "FR":
+        try:
+            base = date.fromisoformat(case.get("receipt_date") or "")
+        except (TypeError, ValueError):
+            base = received
+        due_date = (base + relativedelta(months=3)).isoformat()
+    else:
+        due_date = None
     return {
         "mail_entry_id": message.EntryID,
         "ref": ref,
@@ -1236,7 +1246,7 @@ def assignment_row(message, cache):
         "assigner": names[0][2:] if names else None,
         "app_no": case.get("app_no") or None,
         "applicant": squash(case.get("applicant")) or None,
-        "due_date": _valid_iso(case.get("due_date")) if rejection_type == "OA" else None,
+        "due_date": due_date,
         "reexam": None if reexam is None else int(bool(reexam)),
         "received_at": message.CreationTime.strftime("%Y-%m-%d %H:%M:%S"),
     }
