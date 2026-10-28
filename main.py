@@ -686,6 +686,8 @@ def instruction_ref(message, outlook) -> str:
     subject = message.Subject or ""
     if instruction_mail.SKIP_SUBJECT.search(subject):
         return ""
+    if instruction_mail.is_cc_only(message):
+        return ""
     if not in_inbox(message, outlook) or not sender_matches(message, instruction_senders()):
         return ""
     return instruction_mail.choose(subject, message.Body or "")
@@ -708,6 +710,8 @@ def scan_instructions(outlook, days=INSTRUCTION_SCAN_DAYS):
     for message in inbox_items(outlook, instruction_senders(), since=since):
         try:
             if instruction_mail.received_of(message).date() < since:
+                continue
+            if instruction_mail.is_cc_only(message):
                 continue
             ref = instruction_mail.choose(message.Subject or "", message.Body or "")
             if ref and record_instruction(message, ref, outlook) is not None:

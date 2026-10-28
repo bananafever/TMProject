@@ -96,6 +96,67 @@ def wants_alert(subject: str, body: str) -> bool:
     return bool(EXTENSION.search(client_part(body)))
 
 
+# 사용자 본인 기본 식별 토큰(소문자) — TMProject prenotice_assignee="신용석" 및 영문 표기
+DEFAULT_USER_TOKENS: Tuple[str, ...] = (
+    "신용석",
+    "ysshin",
+    "yong-sok shin",
+    "yong sok shin",
+    "yongsok shin",
+)
+
+
+def is_cc_only(message, tokens: Tuple[str, ...] = ()) -> bool:
+    """메일의 수신/참조 중 사용자가 CC에만 있고 To에는 없는 메일인가?
+
+    사무소 대표 계정(info@)이 고객 메일을 전달할 때 주 담당 변리사가 To,
+    다른 변리사가 CC로 지정되는 관행(2026-10-28)에 따른다.
+    사용자가 CC에만 있고 To에는 없으면 다른 변리사 담당이므로 받은 지시에서 제외한다.
+    """
+    toks = tuple(t.strip().casefold() for t in (tokens or DEFAULT_USER_TOKENS) if t.strip())
+    if not toks:
+        return False
+
+    to_parts: List[str] = []
+    cc_parts: List[str] = []
+
+    # GraphMessage 의 경우 data 내 toRecipients, ccRecipients 에 name 과 address 가 모두 있음
+    data = getattr(message, "data", None)
+    if isinstance(data, dict):
+        for r in data.get("toRecipients") or []:
+            ea = (r or {}).get("emailAddress") or {}
+            to_parts.extend([ea.get("name") or "", ea.get("address") or ""])
+        for r in data.get("ccRecipients") or []:
+            ea = (r or {}).get("emailAddress") or {}
+            cc_parts.extend([ea.get("name") or "", ea.get("address") or ""])
+
+    # COM MailItem 또는 fallback: message.To, message.CC 속성
+    try:
+        to_val = getattr(message, "To", None) or ""
+        if to_val:
+            to_parts.append(str(to_val))
+    except Exception:
+        pass
+
+    try:
+        cc_val = getattr(message, "CC", None) or ""
+        if cc_val:
+            cc_parts.append(str(cc_val))
+    except Exception:
+        pass
+
+    to_text = " ".join(to_parts).casefold()
+    cc_text = " ".join(cc_parts).casefold()
+
+    if not to_text and not cc_text:
+        return False
+
+    in_to = any(t in to_text for t in toks)
+    in_cc = any(t in cc_text for t in toks)
+
+    return in_cc and not in_to
+
+
 def msg_file(root: str, received, ref: str, entry_id: str, ext: str = ".msg") -> str:
     """`<자료 폴더>\\instructions\\YYYY-MM\\YYYYMMDD-HHMM_<Ref>_<EntryID 끝 8자>.msg` — Graph 로 읽은 메일은 `.eml`."""
     safe = re.sub(r"[^A-Za-z0-9-]", "", ref or "") or "NOREF"

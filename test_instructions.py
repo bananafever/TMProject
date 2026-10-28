@@ -215,5 +215,47 @@ class TestMainChoosing(unittest.TestCase):
         self.assertIn("'Lee International IP & Law'", flt)
 
 
+
+class TestCcExclusion(unittest.TestCase):
+    def test_is_cc_only_com(self):
+        m = _message()
+        m.To = "So-Min PARK [박소민]; info_pat1"
+        m.CC = "Yong-Sok SHIN [신용석] <ysshin@leeinternational.com>; other@leeinternational.com"
+        self.assertTrue(IM.is_cc_only(m))
+
+        # To 에 사용자가 있으면 False
+        m.To = "Yong-Sok SHIN [신용석] <ysshin@leeinternational.com>"
+        m.CC = "other@leeinternational.com"
+        self.assertFalse(IM.is_cc_only(m))
+
+        # 둘 다 있으면 False
+        m.To = "신용석"
+        m.CC = "신용석"
+        self.assertFalse(IM.is_cc_only(m))
+
+        # 사용자 토큰이 둘 다 없으면 False
+        m.To = "other1"
+        m.CC = "other2"
+        self.assertFalse(IM.is_cc_only(m))
+
+    def test_is_cc_only_graph(self):
+        m = MagicMock()
+        m.data = {
+            "toRecipients": [{"emailAddress": {"name": "박소민", "address": "smpark@leeinternational.com"}}],
+            "ccRecipients": [{"emailAddress": {"name": "Yong-Sok SHIN", "address": "ysshin@leeinternational.com"}}]
+        }
+        self.assertTrue(IM.is_cc_only(m))
+
+    def test_instruction_ref_skips_cc_only(self):
+        m = _message()
+        m.Parent.EntryID = "INBOX"
+        m.To = "박소민"
+        m.CC = "신용석"
+        outlook = MagicMock()
+        outlook.GetDefaultFolder.return_value.EntryID = "INBOX"
+        with patch.object(main, "sender_matches", return_value=True):
+            self.assertEqual(main.instruction_ref(m, outlook), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -35,11 +35,11 @@ SCOPES = ["Mail.Read", "User.Read"]
 TIMEOUT = 20
 RETRIES = 4
 TRANSLATE_BATCH = 1000                                  # translateExchangeIds 한 번에 넣을 수 있는 수
-LIST_FIELDS = "id,subject,from,receivedDateTime,createdDateTime,hasAttachments,parentFolderId"
+LIST_FIELDS = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,createdDateTime,hasAttachments,parentFolderId"
 NEW_MAIL_SLACK = timedelta(minutes=5)                   # 받은 시각이 서버마다 조금 늦게 잡혀도 놓치지 않게 겹쳐 본다
 # 새 메일 감시에서 뺄 폴더 — 클래식 OnNewMailEx 처럼 「받은」 메일만(규칙이 다른 폴더로 옮긴 것은 본다)
 NOT_RECEIVED_FOLDERS = ("sentitems", "drafts", "outbox", "deleteditems")
-SEARCH_FIELDS = LIST_FIELDS + ",toRecipients,bodyPreview"
+SEARCH_FIELDS = LIST_FIELDS + ",bodyPreview"
 SEARCH_LIMIT = 500                                      # Search 탭이 한 번에 보일 수 — 넘으면 「N통 이상」
 SEARCH_WORKERS = 4                                      # 하위 폴더 검색을 동시에 몇 개
 OL_EMBEDDED_ITEM = 5                                    # instruction_mail 과 같은 COM 값 — 항목으로 붙은 메일
@@ -321,6 +321,8 @@ class GraphMessage:
         self.parent_folder_id = data.get("parentFolderId", "")
         self.To = "; ".join(((r.get("emailAddress") or {}).get("name") or (r.get("emailAddress") or {}).get("address") or "")
                             for r in data.get("toRecipients") or [])
+        self.CC = "; ".join(((r.get("emailAddress") or {}).get("name") or (r.get("emailAddress") or {}).get("address") or "")
+                            for r in data.get("ccRecipients") or [])
         self.Preview = data.get("bodyPreview") or ""
         self._body, self._attachments = data.get("body"), None
 
