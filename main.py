@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import html
 import json
 import logging
 import shutil
@@ -132,8 +133,7 @@ DEFAULT_CONFIG = {
     "applicant_abbr": {},
     # 이 담당자 앞으로 온 위임 메일만 네이버 캘린더에 등록한다
     "calendar_assignees": ["이여름", "한송희"],
-    # 기한 확인 (NAS iplog 차수) — 알림을 넣을 네이버 캘린더 이름, 확인 시각 (warn 기한일 경고 · ext 연장 확인)
-    "alert_calendar": "알림",
+    # 기한 확인 (NAS iplog 차수) — 확인 시각 (warn 기한일 경고 · ext 연장 확인). 알림은 앱 알림 창으로
     "deadline_times": dict(deadline_watch.DEFAULT_TIMES),
     # 받은 지시 — 고객 메일을 전달(FW:)하는 대표 메일함의 보낸 사람 이름. 받은편지함의 이 메일을 NAS instructions 에 적는다
     "instruction_senders": list(instruction_mail.DEFAULT_SENDERS),
@@ -656,6 +656,26 @@ def handle_prenotice(message):
     if added:
         save_case_cache(cache)
     return added
+
+
+def refresh_reexam(subject, received):
+    """거절결정서 위임인데 예고 메일 때 재심사 여부를 못 받았으면(KIPRIS 상한·네트워크) 지금 한 번 더 묻는다.
+    반환값: 새로 받은 재심사 여부, 묻지 않았거나 못 받았으면 None"""
+    refs = ref_num_key.findall(subject or "")
+    if not refs:
+        return None
+    cache = load_case_cache()
+    case = recent_case(find_case(cache, refs[0], FR_DOC_TYPE), received)
+    if not case or "reexam" in case or not case.get("app_no"):
+        return None
+    try:
+        case["reexam"] = kipris.fetch_reexam(case["app_no"])
+    except kipris.KiprisError as e:
+        logging.error(f"KIPRIS 재조회 실패 ({refs[0]} {case['app_no']}): {e}")
+        return None
+    logging.info(f"KIPRIS 재심사 거절결정 여부(위임 때 재조회): {refs[0]} {case['app_no']} → {case['reexam']}")
+    save_case_cache(cache)
+    return case["reexam"]
 
 
 def is_prenotice(message):
@@ -1360,8 +1380,10 @@ def register_delegation(message, always_show=True):
     always_show=False 면(시작할 때 스캔) 바로 등록한 결과는 창 없이 돌려줍니다.
     반환값: [(Ref, 제목, 날짜, 결과), ...]
     """
-    record_assignments([message])  # NAS 에 못 닿아도 일정 등록은 그대로
     rejection_type = rejection_type_of(message)
+    if rejection_type == "FR":                          # 받은 위임 기록(재심사 칸)·일정 제목보다 먼저
+        refresh_reexam(message.Subject, message.CreationTime.date())
+    record_assignments([message])  # NAS 에 못 닿아도 일정 등록은 그대로
     if rejection_type == OTHER_DOC:                     # 등록결정·보정요구서 … — 일정 없음, 받은 위임 기록만(위에서)
         refs = ref_num_key.findall(message.Subject or "")
         logging.info(f"일정 없음 — {refs[0] if refs else '?'} {delegation_doc(message.Subject)}: "
@@ -1575,14 +1597,57 @@ class AbbrSync(qtc.QObject):
             self.done.emit(merged)
 
 
+class DeadlineAlertDialog(qtw.QDialog):
+    """기한 확인 알림 창 — 늘 맨 위에 뜨고 다른 일을 막지 않는다(모달 아님).
+    열려 있는 동안 온 알림은 아래에 덧붙이고, 닫은 뒤 온 알림은 새로 채운다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("기한 확인")
+        self.setWindowFlag(qtc.Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(480, 260)
+        layout = qtw.QVBoxLayout(self)
+        scroll = qtw.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(qtw.QFrame.Shape.NoFrame)
+        holder = qtw.QWidget()
+        self.entries = qtw.QVBoxLayout(holder)
+        self.entries.addStretch(1)
+        scroll.setWidget(holder)
+        layout.addWidget(scroll, 1)
+        btn_box = qtw.QHBoxLayout()
+        btn_box.addStretch(1)
+        ok_btn = qtw.QPushButton("확인")
+        ok_btn.setObjectName("okButton")
+        ok_btn.clicked.connect(self.accept)
+        btn_box.addWidget(ok_btn)
+        layout.addLayout(btn_box)
+
+    def add(self, title, text):
+        if not self.isVisible():
+            while self.entries.count() > 1:
+                self.entries.takeAt(0).widget().deleteLater()
+        body = html.escape(text).replace("\n", "<br>")
+        label = qtw.QLabel(f"<b>{html.escape(title)}</b>" + (f"<br>{body}" if body else ""))
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(qtc.Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setStyleSheet("background-color: #FDF3E1; color: #8A5300; padding: 8px; border-radius: 4px;")
+        label.setSizePolicy(qtw.QSizePolicy.Policy.Preferred, qtw.QSizePolicy.Policy.Maximum)
+        self.entries.insertWidget(self.entries.count() - 1, label)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        qtw.QApplication.alert(self)
+
+
 class DeadlineRunner(qtc.QObject):
-    """1분마다 확인할 때가 됐는지 보고, 됐으면 스레드에서 NAS·KIPRIS 를 본다. 알림 말풍선은 GUI 스레드에서."""
+    """1분마다 확인할 때가 됐는지 보고, 됐으면 스레드에서 NAS·KIPRIS 를 본다. 알림 창은 GUI 스레드에서."""
 
     alert = qtc.Signal(str, str)
 
-    def __init__(self, tray_icon, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.tray_icon = tray_icon
+        self.dialog = DeadlineAlertDialog(parent)
         self.watcher = deadline_watch.Watcher(DEADLINE_STATE_FILE, lambda: config.get("deadline_times"),
                                               mover_factory=action_mover)
         self._busy = threading.Lock()
@@ -1602,14 +1667,14 @@ class DeadlineRunner(qtc.QObject):
         try:
             alerts = self.watcher.tick()
             if alerts:
-                deadline_watch.deliver(alerts, self.alert.emit, naver_cal.Session(), config.get("alert_calendar", ""))
+                deadline_watch.deliver(alerts, self.alert.emit)
         except Exception as e:
             logging.error(f"기한 확인 실패: {e}", exc_info=True)
         finally:
             self._busy.release()
 
     def _show(self, title, text):
-        self.tray_icon.showMessage(title, text, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
+        self.dialog.add(title, text)
 
 
 def on_new_message(message, session):
@@ -2003,10 +2068,6 @@ class MainWin(qtw.QWidget):
 
         watch_form = qtw.QHBoxLayout()
         watch_form.setSpacing(10)
-        watch_form.addWidget(qtw.QLabel("알림 캘린더"))
-        self.alert_calendar_edit = qtw.QLineEdit(config.get("alert_calendar", ""))
-        self.alert_calendar_edit.setPlaceholderText("알림")
-        watch_form.addWidget(self.alert_calendar_edit, 1)
         times = deadline_times()
         self.time_edits = {}
         for kind in deadline_watch.KINDS:
@@ -2017,7 +2078,7 @@ class MainWin(qtw.QWidget):
             watch_form.addWidget(edit)
         watch_box.addLayout(watch_form)
         watch_box.addWidget(hint("기한일 경고: 오늘이 대응기한인데 제출·기연이 없는 차수 · 연장 확인: 그날 기연을 의뢰한 차수를 "
-                                 "KIPRIS 로 확인하고 일정을 옮깁니다. 알림은 트레이 말풍선과 네이버 알림 캘린더(비우면 안 씀)에."))
+                                 "KIPRIS 로 확인하고 일정을 옮깁니다. 알림은 앱 알림 창으로 띄웁니다."))
         settings_main_layout.addWidget(watch_frame)
 
         # 4-4. 메일 — 클래식 Outlook(COM) / 새 Outlook(Microsoft Graph)
@@ -2326,7 +2387,6 @@ class MainWin(qtw.QWidget):
         for name, abbr in sorted(config["applicant_abbr"].items()):
             self._add_abbr_row(name, abbr)
         self.filter_abbr_rows(self.abbr_search.text())
-        config["alert_calendar"] = squash(self.alert_calendar_edit.text())
         config["deadline_times"] = {kind: edit.time().toString("HH:mm") for kind, edit in self.time_edits.items()}
         backend = self.mail_backend_combo.currentData()
         restart = backend != config.get("mail_backend", "outlook")
@@ -2335,7 +2395,7 @@ class MainWin(qtw.QWidget):
         save_config()
         logging.info(f"설정이 변경되었습니다. Parent: {config['parent_path']}, Target: {config['target_path']}, "
                      f"담당자 {len(config['calendar_assignees'])}명, 약칭 {len(config['applicant_abbr'])}개, "
-                     f"알림 캘린더: {config['alert_calendar'] or '(없음)'}, 확인 시각: {config['deadline_times']}, "
+                     f"확인 시각: {config['deadline_times']}, "
                      f"메일: {config['mail_backend']}")
         qtw.QMessageBox.information(self, "Settings", "설정이 저장되었습니다."
                                     + ("\n메일 읽는 곳을 바꿨습니다 — 앱을 다시 켜면 적용됩니다." if restart else ""))
@@ -3024,7 +3084,7 @@ if __name__ == "__main__":
         logging.error(mail_error)
         mw.tray_icon.showMessage("메일을 읽지 못합니다", mail_error, qtw.QSystemTrayIcon.MessageIcon.Warning, 20000)
     # 기한 확인: 1분마다 시각을 보고, 켤 때 놓친 확인은 곧바로 따라잡는다
-    deadline_runner = DeadlineRunner(mw.tray_icon, mw)
+    deadline_runner = DeadlineRunner(mw)
     qtc.QTimer.singleShot(5_000, deadline_runner.tick)
     # 출원인 약칭: NAS 표가 기준 — 켤 때 맞추고 설정 창을 새로 채운다
     abbr_sync = AbbrSync(mw)

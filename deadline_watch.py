@@ -9,7 +9,7 @@
   연장 기한이 KIPRIS 에 반영된 기한과 다르면 KIPRIS 쪽으로 고친다.
 - 12:00 기한일 경고: 오늘이 대응기한(`COALESCE(due_extended, due_date)`)인데 제출도 기연(확인)도 없는 진행 중 차수.
 - 마지막으로 돈 날은 `deadline_state.json` — 앱이 꺼져 있어 놓친 확인은 켤 때 따라잡는다(「늦은 알림」).
-- 알림: 트레이 말풍선(main 이 넘긴 함수) + 네이버 「알림」 캘린더 일정(VALARM) + 로그(History 탭).
+- 알림: 앱 알림 창(main 이 넘긴 함수) + 로그(History 탭). 네이버 「알림」 캘린더 일정은 쓰지 않는다(10-29 사용자).
 """
 
 import json
@@ -36,7 +36,6 @@ DRIFT_AHEAD_DAYS = 7                 # 기연 요청 없이 기한이 바뀌었�
 DRIFT_BEHIND_DAYS = 7                #   (기한 당일 기연 → KIPRIS 반영은 하루 이틀 늦다)
 CLOSED_STATUSES = ("completed", "allowed", "abandoned")
 LATE_PREFIX = "늦은 알림"
-ALERT_LEAD = timedelta(minutes=1)    # 네이버 알림 일정은 지금보다 조금 뒤에 — 이미 지난 시각은 울리지 않는다
 
 _OPEN = ("p.submitted_date IS NULL AND (p.status IS NULL OR p.status NOT IN (%s))"
          % ", ".join("'%s'" % s for s in CLOSED_STATUSES))
@@ -384,20 +383,13 @@ class Watcher:
         return alerts
 
 
-def deliver(alerts: List[Alert], tray: Optional[Callable[[str, str], None]], session, alert_calendar: str,
-            now: Optional[datetime] = None) -> None:
-    """알림 — 로그(History 탭) · 트레이 말풍선 · 네이버 알림 캘린더(조금 뒤 시각, VALARM). 예외를 내지 않는다."""
-    now = now or datetime.now()
+def deliver(alerts: List[Alert], notify: Optional[Callable[[str, str], None]]) -> None:
+    """알림 — 로그(History 탭) · 앱 알림 창(notify). 예외를 내지 않는다."""
     for a in alerts:
         title, text = a.full_title, a.text
         logging.warning(f"[기한 확인] {title}\n  " + "\n  ".join(a.lines))
-        if tray:
+        if notify:
             try:
-                tray(title, text)
+                notify(title, text)
             except Exception as e:
-                logging.error(f"트레이 알림 실패: {e}")
-        if alert_calendar and session is not None:
-            try:
-                session.add_alert(alert_calendar, title, (now + ALERT_LEAD).astimezone(), text)
-            except Exception as e:
-                logging.error(f"네이버 알림 일정 등록 실패: {title} — {e}")
+                logging.error(f"알림 창 실패: {e}")

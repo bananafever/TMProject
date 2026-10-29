@@ -640,6 +640,23 @@ class TestHandlePrenoticeFr(TestHandlePrenotice):
         fetch.assert_called_once()
         self.assertIs(self._case()["reexam"], False)
 
+    def test_delegation_requeries_missing_reexam(self):
+        """예고 메일 때 못 받은 재심사 여부(KIPRIS 상한)는 위임 메일 때 한 번 더 묻는다 — 받으면 다시 묻지 않는다"""
+        with patch.object(kipris, "fetch_reexam", side_effect=kipris.KiprisError("상한")):
+            main.handle_prenotice(self._message())
+        subject = "[위임] PA-2T9001; 이여름(팀); 거절결정서; 001 [서 2026-10-22]"
+        with patch.object(kipris, "fetch_reexam", return_value=True) as fetch:
+            self.assertIs(main.refresh_reexam(subject, date(2026, 10, 13)), True)
+            self.assertIsNone(main.refresh_reexam(subject, date(2026, 10, 13)))
+        fetch.assert_called_once_with("10-2014-0049963")
+        self.assertIs(self._case()["reexam"], True)
+
+    def test_delegation_requery_failure_leaves_unknown(self):
+        with patch.object(kipris, "fetch_reexam", side_effect=kipris.KiprisError("상한")):
+            main.handle_prenotice(self._message())
+            self.assertIsNone(main.refresh_reexam("[위임] PA-2T9001; 거절결정서", date(2026, 10, 13)))
+        self.assertNotIn("reexam", self._case())
+
     test_stores_due_date_and_skips_repeat = None
     test_stores_applicant = None
     test_fills_applicant_on_old_entry_without_kipris = None
@@ -811,6 +828,19 @@ class TestNaverRegistration(unittest.TestCase):
 
 class TestNaverCal(unittest.TestCase):
     """naver_cal — iCalendar 만들기와 CalDAV 흐름 (네트워크는 가짜)"""
+
+    def test_mac_credentials_from_keychain(self):
+        """맥은 DPAPI 가 없어 키체인에서 읽는다 (예전에는 늘 「네이버 계정이 없습니다」)"""
+        found = MagicMock(returncode=0, stdout='{"user": "me", "password": "pw"}\n')
+        with patch.dict(os.environ, {"NAVER_ID": "", "NAVER_APP_PASSWORD": ""}), \
+                patch.object(naver_cal.sys, "platform", "darwin"), \
+                patch.object(naver_cal.subprocess, "run", return_value=found) as run:
+            self.assertEqual(naver_cal.credentials(), ("me", "pw"))
+            run.return_value = MagicMock(returncode=0, stdout='{"user": "me", "password": "한"}'.encode().hex())
+            self.assertEqual(naver_cal.credentials(), ("me", "한"))
+            run.return_value = MagicMock(returncode=44, stdout="")
+            self.assertIsNone(naver_cal.credentials())
+        self.assertEqual(run.call_args.args[0][:2], ["security", "find-generic-password"])
 
     def test_uid_deterministic(self):
         a = naver_cal.make_uid("기한", "PA-2T8084_의견서", date(2027, 2, 8))

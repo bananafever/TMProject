@@ -2,10 +2,11 @@
 
 - 서버: https://caldav.calendar.naver.com — 네이버 2단계 인증을 켠 뒤 발급한 「애플리케이션 비밀번호」로 접속한다
   (네이버 로그인 비밀번호로는 안 된다).
-- 계정: 환경변수 `NAVER_ID`·`NAVER_APP_PASSWORD` → %APPDATA%\\TMProject\\naver_cred.dat (DPAPI 봉인 JSON).
+- 계정: 환경변수 `NAVER_ID`·`NAVER_APP_PASSWORD` → 윈도는 %APPDATA%\\TMProject\\naver_cred.dat (DPAPI 봉인 JSON),
+  맥은 키체인 「TMProject Naver」 항목(JSON, `security` 명령으로 읽고 쓴다 — 맥에는 DPAPI 가 없다, 10-29).
   `python naver_cal.py --setup` 으로 저장하고, 접속해서 캘린더 이름 목록을 보여 준다.
 - 중복: UID 를 (캘린더·제목·날짜)로 정해 `{캘린더}/{UID}.ics` 에 PUT 한다. 이미 있으면 건너뛴다.
-- 옮기기(기한 연장): 새 날짜로 만들고 옛 날짜의 UID 를 DELETE. 알림: 그 시각에 울리는 VALARM 일정.
+- 옮기기(기한 연장): 새 날짜로 만들고 옛 날짜의 UID 를 DELETE.
 - 표준 라이브러리만 쓴다(kipris.py 와 같이 urllib).
 """
 
@@ -14,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +30,8 @@ TIMEOUT = 10
 MAX_BODY = 2000                      # DESCRIPTION 에 넣을 본문 최대 글자 수
 
 _ENTROPY = b"TMProject/naver/v1"     # DPAPI 보조 엔트로피 (비밀 아님)
+_MAC_SERVICE = "TMProject Naver"      # 맥 키체인 항목
+_MAC_ACCOUNT = "credentials"
 _NS = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"}
 
 
@@ -41,15 +46,26 @@ def _cred_path() -> Path:
     return (Path(base) / "TMProject" if base else Path.home() / ".tmproject") / "naver_cred.dat"
 
 
+def _security(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
+    return subprocess.run(["security", *args], input=stdin, capture_output=True, text=True, timeout=10)
+
+
 def credentials() -> Optional[Tuple[str, str]]:
-    """환경변수 → naver_cred.dat. 없으면 None."""
+    """환경변수 → 맥 키체인 / 윈도 naver_cred.dat. 없으면 None."""
     user = (os.getenv("NAVER_ID") or "").strip()
     password = (os.getenv("NAVER_APP_PASSWORD") or "").strip()
     if user and password:
         return user, password
     try:
-        import win32crypt
-        _desc, raw = win32crypt.CryptUnprotectData(_cred_path().read_bytes(), _ENTROPY, None, None, 0)
+        if sys.platform == "darwin":
+            done = _security("find-generic-password", "-s", _MAC_SERVICE, "-a", _MAC_ACCOUNT, "-w")
+            if done.returncode != 0:
+                return None
+            text = done.stdout.strip()
+            raw = bytes.fromhex(text) if re.fullmatch(r"(?:[0-9a-f]{2})+", text) else text.encode("utf-8")  # ASCII 가 아니면 16진수로 나온다
+        else:
+            import win32crypt
+            _desc, raw = win32crypt.CryptUnprotectData(_cred_path().read_bytes(), _ENTROPY, None, None, 0)
         values = json.loads(raw.decode("utf-8"))
         user, password = values.get("user", "").strip(), values.get("password", "").strip()
         return (user, password) if user and password else None
@@ -57,13 +73,22 @@ def credentials() -> Optional[Tuple[str, str]]:
         return None
 
 
-def save_credentials(user: str, password: str) -> Path:
+def save_credentials(user: str, password: str) -> str:
+    """저장한 곳을 돌려준다. 맥은 비밀번호가 명령줄(ps)에 보이지 않게 `security -i` 의 표준 입력으로,
+    따옴표 걱정 없게 16진수(-X)로 넘긴다."""
+    data = json.dumps({"user": user, "password": password})
+    if sys.platform == "darwin":
+        hexed = data.encode("utf-8").hex()
+        done = _security("-i", stdin=f'add-generic-password -U -s "{_MAC_SERVICE}" -a {_MAC_ACCOUNT} -X {hexed}\n')
+        if done.returncode != 0 or credentials() != (user, password):
+            raise NaverError(f"키체인에 저장하지 못했습니다: {(done.stderr or done.stdout).strip()}")
+        return f"키체인 「{_MAC_SERVICE}」"
     import win32crypt
-    data = json.dumps({"user": user, "password": password}).encode("utf-8")
+    data = data.encode("utf-8")
     path = _cred_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(win32crypt.CryptProtectData(data, "TMProject Naver", _ENTROPY, None, None, 0))
-    return path
+    return str(path)
 
 
 # ── iCalendar ────────────────────────────────────────────────────────
@@ -116,37 +141,6 @@ def build_ics(uid: str, subject: str, day: date, body: str, now: Optional[dateti
         f"SUMMARY:{_escape(subject)}",
         *([f"DESCRIPTION:{_escape(body)}"] if body else []),
         "TRANSP:TRANSPARENT",
-        "END:VEVENT",
-        "END:VCALENDAR",
-    ]
-    return "\r\n".join(_fold(line) for line in lines) + "\r\n"
-
-
-def build_alert_ics(uid: str, subject: str, start: datetime, body: str, minutes: int = 10,
-                    now: Optional[datetime] = None) -> str:
-    """알림 일정 하나 — start(시각)에 시작하고 그때 울리는 VALARM. 시각은 UTC 로 적는다."""
-    now = now or datetime.now(timezone.utc)
-    start = start if start.tzinfo else start.astimezone()  # 순진한 시각은 이 PC 의 지역 시각
-    end = start + timedelta(minutes=minutes)
-    if len(body) > MAX_BODY:
-        body = body[:MAX_BODY] + "…"
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//TMProject//TaskManager//KO",
-        "CALSCALE:GREGORIAN",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"DTSTAMP:{now.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
-        f"DTSTART:{start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
-        f"DTEND:{end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}",
-        f"SUMMARY:{_escape(subject)}",
-        *([f"DESCRIPTION:{_escape(body)}"] if body else []),
-        "BEGIN:VALARM",
-        "ACTION:DISPLAY",
-        f"DESCRIPTION:{_escape(subject)}",
-        "TRIGGER:PT0S",
-        "END:VALARM",
         "END:VEVENT",
         "END:VCALENDAR",
     ]
@@ -305,7 +299,7 @@ class Session:
             raise NaverError(f"네이버 캘린더 「{calendar_name}」 에 일정을 쓰지 못했습니다 (HTTP 404).")
         return True
 
-    # 옮기기·알림 (기한 확인) ─────────────────────────────
+    # 옮기기 (기한 확인) ───────────────────────────────
     def delete_all_day(self, calendar_name: str, subject: str, day: date) -> bool:
         """이 앱이 (캘린더·제목·날짜)로 등록한 일정을 지운다. 지웠으면 True, 없었으면 False."""
         status, _final, _text = self._request("DELETE", self._event_url(calendar_name, make_uid(calendar_name, subject, day)))
@@ -330,21 +324,6 @@ class Session:
             deleted = status != 404
         return added, deleted
 
-    def add_alert(self, calendar_name: str, subject: str, start: datetime, body: str = "") -> bool:
-        """알림 일정(그 시각에 울림). 같은 캘린더·제목·날짜가 이미 있으면 False."""
-        uid = make_uid(calendar_name, subject, start.date())
-        event_url = self._event_url(calendar_name, uid)
-        status, _final, _text = self._request("GET", event_url)
-        if status != 404:
-            return False
-        status, _final, _text = self._request("PUT", event_url, build_alert_ics(uid, subject, start, body), {
-            "Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"})
-        if status == 412:
-            return False
-        if status == 404:
-            raise NaverError(f"네이버 캘린더 「{calendar_name}」 에 알림을 쓰지 못했습니다 (HTTP 404).")
-        return True
-
 
 # ── 설정 도우미 ──────────────────────────────────────────────────────
 
@@ -360,7 +339,11 @@ def _setup():
     except NaverError as e:
         print(f"접속 실패: {e}")
         return 1
-    print(f"저장: {save_credentials(user, password)}")
+    try:
+        print(f"저장: {save_credentials(user, password)}")
+    except NaverError as e:
+        print(e)
+        return 1
     print("\n네이버 캘린더 목록:")
     for name in names:
         print(f"  - {name}")

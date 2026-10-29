@@ -6,8 +6,10 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
 - 키: ChekPat 과 같은 키를 쓴다. 환경변수 `KIPRIS_API_KEY` → %APPDATA%\\ChekPat\\kipris_key.dat
   → %APPDATA%\\ChekPat\\credentials.dat 의 `KIPRIS_API_KEY` 순서. 두 파일은 DPAPI 로 봉인되어 있다.
 - 호출 수: 무료 월 1,000회가 키 단위라 NAS `iplog.kipris_usage`(키의 SHA-256 앞 16자 × 달)에 ChekPat(윈도·맥)과 같이 센다
-  (상한 900, 10-27). NAS 에 닿지 않으면 ChekPat 의 settings.json `kipris_calls` 로 잇고, 닿을 때 못 올린 만큼 올린다
+  (ChekPat 상한 900, 10-27). NAS 에 닿지 않으면 ChekPat 의 settings.json `kipris_calls` 로 잇고, 닿을 때 못 올린 만큼 올린다
   (`kipris_reported`). ChekPat `app/modules/patent/kipris_usage.py` 와 같은 표·같은 규칙이다 — 바꾸면 양쪽을 함께.
+  다만 이 앱의 상한은 950 이다 — 이 앱의 호출은 한 달 몇 번뿐인데 빠지면 일정이 틀린다. ChekPat 이 900 을 다 쓴 달
+  (10-28)에 재심사 여부를 못 받은 일이 있어, ChekPat 이 멈춘 뒤에도 이 앱은 50회를 더 쓴다(10-29).
 - 응답 필드: `Mailingnumber`(발송번호)·`DocNm`(서류명)·`ExpirationDuedateDate`(연장 반영 마감기한).
 - 「특허·실용 서지 상세」(`/kipo-api/kipi/` 게이트, 키는 `ServiceKey`)로 거절결정이 재심사에 의한 것인지 가린다
   — `finalDisposal`(「거절결정(일반)」·「거절결정(재심사)」)과 서류 목록(「…보정서(재심사)」).
@@ -37,7 +39,7 @@ BASE_URL = "https://plus.kipris.or.kr"
 _GATEWAYS = {"openapi": ("openapi/rest", "accessKey"), "kipo": ("kipo-api/kipi", "ServiceKey")}
 DUE_DATE_PATH = "DueDateService/dueDateApplicationNoticeApplnoInfo"
 BIBLIO_PATH = "patUtiModInfoSearchSevice/getBibliographyDetailInfoSearch"   # kipo 게이트에만 있다
-MONTHLY_CAP = 900                    # 무료 1,000회에서 손으로 찾아볼 여유 100회 (ChekPat 과 같음)
+MONTHLY_CAP = 950                    # 무료 1,000회에서 손으로 찾아볼 여유 50회. ChekPat 은 900 에서 멈춘다
 MIN_INTERVAL = 0.1                   # 초. 초당 50회를 넘기면 IP 가 막힌다
 TIMEOUT = 10
 

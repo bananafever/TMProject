@@ -3,7 +3,7 @@
 import os
 import tempfile
 import unittest
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from unittest.mock import MagicMock, patch
 
 # test_calendar 가 (없으면) win32com·PySide6 를 가짜로 끼우고 임시 데이터 폴더를 정한다 — main 보다 먼저 들인다
@@ -365,19 +365,12 @@ class TestWatcher(unittest.TestCase):
         self.assertEqual(seen, [(date(2026, 10, 22), False), (date(2026, 10, 23), False), (date(2026, 10, 24), True)])
 
     def test_deliver(self):
-        tray = MagicMock()
-        session = MagicMock()
-        now = datetime(2026, 10, 24, 12, 0)
-        dw.deliver([dw.Alert("대응기한 오늘 — 제출·기연 없음 1건", ["PA-2T8084 R2"])], tray, session, "알림", now)
-        tray.assert_called_once_with("대응기한 오늘 — 제출·기연 없음 1건", "PA-2T8084 R2")
-        cal, title, start, body = session.add_alert.call_args.args
-        self.assertEqual((cal, body), ("알림", "PA-2T8084 R2"))
-        self.assertEqual(start.replace(tzinfo=None), now + dw.ALERT_LEAD)
-        session.add_alert.reset_mock()
-        session.add_alert.side_effect = naver_cal.NaverError("끊김")
-        dw.deliver([dw.Alert("x", ["y"])], None, session, "알림", now)   # 예외를 내지 않는다
-        dw.deliver([dw.Alert("x", ["y"])], None, session, "", now)
-        self.assertEqual(session.add_alert.call_count, 1)
+        notify = MagicMock()
+        dw.deliver([dw.Alert("대응기한 오늘 — 제출·기연 없음 1건", ["PA-2T8084 R2"])], notify)
+        notify.assert_called_once_with("대응기한 오늘 — 제출·기연 없음 1건", "PA-2T8084 R2")
+        notify.side_effect = RuntimeError("창 없음")
+        dw.deliver([dw.Alert("x", ["y"])], notify)   # 예외를 내지 않는다
+        dw.deliver([dw.Alert("x", ["y"])], None)
 
 
 class TestNaverMoveAndAlert(unittest.TestCase):
@@ -425,23 +418,6 @@ class TestNaverMoveAndAlert(unittest.TestCase):
         s, _calls, _store = self._session([("기한", "x", date(2026, 11, 2))])
         self.assertTrue(s.delete_all_day("기한", "x", date(2026, 11, 2)))
         self.assertFalse(s.delete_all_day("기한", "x", date(2026, 11, 2)))
-
-    def test_alert_ics_has_valarm(self):
-        start = datetime(2026, 10, 24, 12, 1, tzinfo=timezone(timedelta(hours=9)))
-        ics = naver_cal.build_alert_ics("u@tmproject", "대응기한 오늘", start, "PA-2T8084 R2",
-                                        now=datetime(2026, 10, 24, 3, 0, tzinfo=timezone.utc))
-        self.assertIn("DTSTART:20261024T030100Z\r\n", ics)
-        self.assertIn("DTEND:20261024T031100Z\r\n", ics)
-        self.assertIn("BEGIN:VALARM\r\nACTION:DISPLAY\r\n", ics)
-        self.assertIn("TRIGGER:PT0S\r\n", ics)
-        self.assertEqual(naver_cal.ics_description(ics), "PA-2T8084 R2")
-
-    def test_add_alert_once_per_day(self):
-        s, calls, _store = self._session()
-        start = datetime(2026, 10, 24, 12, 1).astimezone()
-        self.assertTrue(s.add_alert("알림", "대응기한 오늘", start, "x"))
-        self.assertFalse(s.add_alert("알림", "대응기한 오늘", start, "x"))
-        self.assertEqual([m for m, _u, _b in calls].count("PUT"), 1)
 
     def test_ics_description_unescape(self):
         ics = naver_cal.build_ics("u", "s", date(2026, 1, 1), "a;b,c\\d\n" + "가" * 60)
