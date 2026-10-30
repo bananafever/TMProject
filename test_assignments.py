@@ -110,7 +110,8 @@ class TestRecord(unittest.TestCase):
 
     def test_credentials_from_mac_keychain(self):
         fake_mac_cred = {"DB_HOST": "mac.nas.local", "DB_PORT": "3307", "DB_USERNAME": "mac_u", "DB_PASSWORD": "mac_p"}
-        with patch.object(db.kipris, "_mac_credentials", return_value=fake_mac_cred):
+        with patch.object(db.kipris.sys, "platform", "darwin"), \
+                patch.object(db.kipris, "_mac_credentials", return_value=fake_mac_cred):
             self.assertEqual(db.credentials(), {"host": "mac.nas.local", "port": 3307, "user": "mac_u", "password": "mac_p"})
 
     def test_tests_never_see_real_credentials(self):
