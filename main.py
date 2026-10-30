@@ -1276,8 +1276,7 @@ def is_calendar_delegation(message):
     return sender_matches(message, CALENDAR_SENDERS)
 
 
-OTHER_DOC = "OTHER"            # 의견제출통지서·거절결정서가 아닌 위임(등록결정·보정요구서 …) — 일정을 만들지 않는다(10-24 사용자)
-_OA_WORD = re.compile(r"의견\s*제출\s*통지|^OA$|office\s*action", re.I)
+OTHER_DOC = "OTHER"            # 거절예고·거절결정서가 아닌 위임(등록결정·보정요구서 …) — 일정을 만들지 않는다(10-24·10-30 사용자)
 
 
 def delegation_doc(subject):
@@ -1287,13 +1286,12 @@ def delegation_doc(subject):
 
 
 def rejection_type_of(message):
-    """「FR」(거절결정) · 「OA」(의견제출통지서, 서류 이름이 없는 예전 꼴도) · 「OTHER」(그 밖의 서류 이름 — 등록결정·보정요구서 …).
-    예전에는 거절결정서가 아니면 모두 OA 로 보아 「_의견서」 일정을 만들었다."""
+    """제목에 「거절결정서」 → 「FR」 · 「거절예고」 → 「OA」(의견제출통지서) · 그 밖(등록결정·보정요구서·서류 이름 없음 …) → 「OTHER」.
+    10-30 사용자: OA 위임은 제목에 「거절예고(신규성)」 처럼 「거절예고」 가 붙는다 — 「의견제출통지」·「OA」 낱말로 가리지 않는다."""
     subject = message.Subject or ""
-    doc = delegation_doc(subject)
-    if "거절결정서" in subject or "거절결정" in doc:
+    if "거절결정서" in subject:
         return "FR"
-    if not doc or _OA_WORD.search(doc):
+    if re.search(r"거절\s*예고", subject):
         return "OA"
     return OTHER_DOC
 
