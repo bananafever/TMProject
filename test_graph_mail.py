@@ -80,6 +80,67 @@ def _eid(mid):
     return ("EID-" + mid).encode().hex().upper()
 
 
+class TestMacTokenCache(unittest.TestCase):
+    """맥 토큰 캐시 — 열쇠만 `security` 로 키체인에, 캐시는 암호화 파일에 (빌드마다 키체인 암호를 묻지 않게)"""
+
+    def _security(self, store):
+        calls = []
+
+        def run(*args, stdin=""):
+            calls.append((args, stdin))
+            if args[0] == "find-generic-password":
+                return MagicMock(returncode=0 if "k" in store else 44, stdout=store.get("k", "") + "\n")
+            store["k"] = stdin.split(' -w "', 1)[1].split('"', 1)[0]
+            return MagicMock(returncode=0, stdout="")
+        return run, calls
+
+    def test_key_made_once_then_reused(self):
+        store = {}
+        run, calls = self._security(store)
+        key = G.mac_cache_key(run)
+        self.assertEqual(len(key), 44)
+        self.assertEqual(calls[1][0], ("-i",))                         # 열쇠는 명령줄이 아니라 표준 입력으로
+        self.assertNotIn(key.decode(), " ".join(a for args, _s in calls for a in args))
+        run2, calls2 = self._security(store)
+        self.assertEqual(G.mac_cache_key(run2), key)
+        self.assertEqual(len(calls2), 1)                               # 있으면 읽기만
+
+    def test_key_not_saved_raises(self):
+        run = lambda *a, stdin="": MagicMock(returncode=44, stdout="")  # noqa: E731
+        with self.assertRaises(G.GraphError):
+            G.mac_cache_key(run)
+
+    def test_file_is_encrypted_and_round_trips(self):
+        from cryptography.fernet import Fernet
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "graph_token_mac.bin"
+            key = Fernet.generate_key()
+            G._mac_persistence(path, key).save('{"RefreshToken": "secret"}')
+            self.assertNotIn("secret", path.read_text())
+            self.assertEqual(G._mac_persistence(path, key).load(), '{"RefreshToken": "secret"}')
+
+    def test_moves_old_keychain_cache_once(self):
+        from cryptography.fernet import Fernet
+        with tempfile.TemporaryDirectory() as tmp:
+            path, old = Path(tmp) / "graph_token_mac.bin", Path(tmp) / "graph_token.bin"
+            old.touch()
+            key = Fernet.generate_key()
+            with patch("msal_extensions.KeychainPersistence") as kp:
+                kp.return_value.load.return_value = '{"old": 1}'
+                self.assertEqual(G._mac_persistence(path, key, old).load(), '{"old": 1}')
+                G._mac_persistence(path, key, old)
+            self.assertEqual(kp.call_count, 1)                        # 옮긴 뒤에는 키체인을 열지 않는다
+
+    def test_old_cache_unreadable_means_login_again(self):
+        from cryptography.fernet import Fernet
+        with tempfile.TemporaryDirectory() as tmp:
+            path, old = Path(tmp) / "graph_token_mac.bin", Path(tmp) / "graph_token.bin"
+            old.touch()
+            with patch("msal_extensions.KeychainPersistence", side_effect=RuntimeError("denied")):
+                G._mac_persistence(path, Fernet.generate_key(), old)
+            self.assertFalse(path.exists())
+
+
 class TestIds(unittest.TestCase):
     def test_entry_id_hex_all_paddings(self):
         for size in (30, 31, 32):                      # base64 패딩 0·2·1 개

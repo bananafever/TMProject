@@ -5,7 +5,9 @@ settings.json `mail_backend: "graph"` 일 때 main 이 클래식 Outlook COM 대
 - 앱: 회사 Entra 의 「TaskManager」(사용자 소유, 단일 테넌트, public client). `graph_client_id`·`graph_tenant_id` 는
   settings.json 에만 둔다. 리디렉션 URI `http://localhost` 가 있어야 MSAL 대화형 로그인이 돌아온다(10-25 추가).
 - 권한: `Mail.Read` + `User.Read` — `translateExchangeIds` 가 회사 계정 위임에서 `User.ReadBasic.All` 이상을 요구한다.
-- 토큰 캐시는 msal-extensions(Windows DPAPI · macOS Keychain)로 `%APPDATA%\\TMProject` / `~/.tmproject` 에 둔다(naver_cal 과 같은 자리).
+- 토큰 캐시는 `%APPDATA%\\TMProject` / `~/.tmproject` 에 둔다(naver_cal 과 같은 자리). Windows 는 msal-extensions(DPAPI).
+  맥은 파일을 Fernet 으로 암호화하고 열쇠만 키체인에 `security` 로 둔다 — msal-extensions 처럼 앱이 키체인을 직접 열면
+  ad-hoc 서명이 빌드마다 바뀌어 켤 때마다 로그인 암호를 물었다(10-30).
 - `GraphMessage` 는 main·instruction_mail 이 쓰는 COM MailItem 속성 이름(`Subject`, `Body`, `CreationTime`, `EntryID`,
   `Attachments`, `SaveAs` …)을 그대로 내준다 — 아래쪽 처리 코드는 메일이 어디서 왔는지 모른다.
 - `EntryID` 는 클래식 Outlook 과 같은 값(대문자 hex)으로 바꿔 둔다 — NAS `mail_entry_id` 와 상태 파일(calendar_state·
@@ -21,6 +23,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -63,12 +67,66 @@ def cache_path() -> Path:
     return (Path(base) / "TMProject" if base else Path.home() / ".tmproject") / "graph_token.bin"
 
 
+_MAC_KEY_SERVICE = "TMProject Graph"                    # 맥 키체인 항목 — 토큰 캐시 파일의 열쇠
+_MAC_KEY_ACCOUNT = "token-cache-key"
+
+
+def _security(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
+    return subprocess.run(["security", *args], input=stdin, capture_output=True, text=True, timeout=10)
+
+
+def mac_cache_key(security=_security) -> bytes:
+    """키체인의 토큰 캐시 열쇠(Fernet). 없으면 만들어 둔다. `/usr/bin/security` 가 만든 항목은 그것이 읽으니
+    앱을 다시 빌드해도 암호를 묻지 않는다(naver_cal 과 같다)."""
+    def read():
+        got = security("find-generic-password", "-s", _MAC_KEY_SERVICE, "-a", _MAC_KEY_ACCOUNT, "-w")
+        return got.stdout.strip() if got.returncode == 0 else ""
+    key = read()
+    if not key:
+        from cryptography.fernet import Fernet
+        made = Fernet.generate_key().decode()           # 명령줄(ps)에 보이지 않게 `security -i` 표준 입력으로
+        security("-i", stdin=f'add-generic-password -U -s "{_MAC_KEY_SERVICE}" -a {_MAC_KEY_ACCOUNT} -w "{made}"\n')
+        key = read()
+        if key != made:
+            raise GraphError("키체인에 Graph 토큰 캐시 열쇠를 저장하지 못했습니다.")
+    return key.encode()
+
+
+def _mac_persistence(path: Path, key: bytes, old_signal: Optional[Path] = None):
+    """맥 토큰 캐시 — path 에 Fernet 으로 암호화해 둔다. path 가 없고 예전 msal-extensions 키체인 캐시(old_signal)가
+    있으면 한 번 옮긴다(그때 마지막으로 키체인 암호를 물을 수 있다 — 못 옮기면 다시 로그인)."""
+    from cryptography.fernet import Fernet
+    from msal_extensions.persistence import FilePersistence
+
+    class FernetFilePersistence(FilePersistence):
+        is_encrypted = True
+
+        def save(self, content):
+            super().save(fernet.encrypt(content.encode("utf-8")).decode("ascii"))
+
+        def load(self):
+            return fernet.decrypt(super().load().encode("ascii")).decode("utf-8")
+
+    fernet = Fernet(key)
+    persistence = FernetFilePersistence(str(path))
+    if not path.exists() and old_signal is not None and old_signal.exists():
+        try:
+            from msal_extensions import KeychainPersistence
+            persistence.save(KeychainPersistence(str(old_signal)).load())
+            logging.info("Graph 토큰 캐시를 키체인(msal-extensions)에서 암호화 파일로 옮겼습니다.")
+        except Exception as e:                          # noqa: BLE001
+            logging.warning(f"예전 Graph 토큰 캐시를 옮기지 못했습니다 — 다시 로그인하세요: {e}")
+    return persistence
+
+
 def _token_cache(path: Path):
     """암호화 토큰 캐시 — 못 만들면(Keychain·DPAPI 없음) 메모리 캐시: 켤 때마다 로그인해야 한다."""
     import msal
     try:
         from msal_extensions import PersistedTokenCache, build_encrypted_persistence
         path.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "darwin":
+            return PersistedTokenCache(_mac_persistence(path.with_name("graph_token_mac.bin"), mac_cache_key(), path))
         return PersistedTokenCache(build_encrypted_persistence(str(path)))
     except Exception as e:                              # noqa: BLE001
         logging.error(f"Graph 토큰 캐시를 암호화해 둘 수 없습니다 — 메모리에만 둡니다: {e}")
