@@ -159,6 +159,7 @@ class MailSearchPage(qtw.QWidget):
         self.query.setPlaceholderText("검색어 입력 — from:이름  subject:제목  body:본문")
         self.query.setClearButtonEnabled(True)
         self.query.returnPressed.connect(self.search)
+        self.query.textChanged.connect(self._on_query_changed)
 
         self.folder_combo = qtw.QComboBox()
         self.folder_combo.setView(qtw.QListView())
@@ -184,7 +185,8 @@ class MailSearchPage(qtw.QWidget):
 
         # 2행: 세부 필터 (기간, 첨부 여부, 하위 폴더 포함, 보낸 사람) + 상태 라벨
         row2 = qtw.QHBoxLayout()
-        row2.setSpacing(12)
+        row2.setSpacing(8)
+        row2.setAlignment(qtc.Qt.AlignVCenter)
 
         period_lbl = qtw.QLabel("기간:")
         period_lbl.setStyleSheet("color: #64748B; font-weight: 500;")
@@ -195,8 +197,17 @@ class MailSearchPage(qtw.QWidget):
             self.period.addItem(label, delta)
         self.period.setCurrentIndex(3)
 
-        self.has_attachments = qtw.QCheckBox("📎 첨부 있음")
-        self.subfolders = qtw.QCheckBox("하위 폴더 포함")
+        self.has_attachments = qtw.QPushButton("📎 첨부 있음")
+        self.has_attachments.setObjectName("filterChip")
+        self.has_attachments.setProperty("class", "filterChip")
+        self.has_attachments.setCheckable(True)
+        self.has_attachments.setCursor(qtc.Qt.PointingHandCursor)
+
+        self.subfolders = qtw.QPushButton("하위 폴더 포함")
+        self.subfolders.setObjectName("filterChip")
+        self.subfolders.setProperty("class", "filterChip")
+        self.subfolders.setCheckable(True)
+        self.subfolders.setCursor(qtc.Qt.PointingHandCursor)
         self.subfolders.setChecked(True)
         self.subfolders.setEnabled(False)
 
@@ -403,9 +414,25 @@ class MailSearchPage(qtw.QWidget):
         self.search_btn.setEnabled(True)
         self.status.setText(text)
 
+    def _on_query_changed(self, text):
+        if not text.strip():
+            self.clear_results()
+
+    def clear_results(self):
+        self.table.setSortingEnabled(False)
+        self.table.clearContents()
+        self.table.setRowCount(0)
+        self.table.setSortingEnabled(True)
+        self._clear_preview()
+        if not self._busy:
+            self.status.setText("")
+
     def _show_results(self, result, seconds):
         self._busy = False
         self.search_btn.setEnabled(True)
+        if not self.query.text().strip():
+            self.clear_results()
+            return
         count = f"{len(result)}통 이상 — 조건을 좁혀 보세요" if result.truncated else f"{len(result)}통"
         self.status.setText(f"{count} · {seconds:.1f}초")
         box = self.get_mailbox()
