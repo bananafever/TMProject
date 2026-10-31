@@ -281,6 +281,23 @@ class TestSharedCount(_Base):
         kipris._count_call()                                            # 앱 A: 이미 정산됨
         self.assertEqual(self.nas_total(), 3)
 
+    def test_corrupt_ledger_restarts_without_remigrating(self):
+        """ChekPat 과 같다 — 못 읽는 셈 파일은 새 발신자 번호로 새로 시작하고 옛 settings.json 을 다시 옮기지 않는다."""
+        d = self.appdata / "ChekPat"
+        d.mkdir(parents=True)
+        (d / "settings.json").write_text(json.dumps({"kipris_calls": {self.ym: 5}}), encoding="utf-8")
+        (d / "kipris_ledger.json").write_text("{깨진", encoding="utf-8")
+        kipris._count_call()
+        self.assertEqual(self.entry(), {"calls": 1, "reported": 1, "full": False})
+        self.assertRegex(self.ledger()["src"], r"^[0-9a-f]{16}$")
+
+    def test_offline_exit_still_prunes_settled_old_entries(self):
+        kid = kipris.key_id(KEY)
+        self.nas.down = True
+        self.put_ledger({f"{kid}|2026-01": {"calls": 2, "reported": 2, "full": False}})
+        kipris._count_call(date(2026, 11, 1))
+        self.assertNotIn(f"{kid}|2026-01", self.ledger()["entries"])
+
     def test_file_lock_is_exclusive(self):
         path = self.appdata / "x.lock"
         with kipris._locked_file(path):
@@ -399,6 +416,26 @@ class TestBlocked(_Base):
         with self.assertRaises(kipris.KiprisError):                     # 다음 호출은 보내지 않는다
             kipris._send("path", {})
         self.assertEqual(len(self.sent), 1)
+
+    def test_result_code_30_is_not_a_block(self):
+        """규약 6절 — 키·상품 미등록은 막힘이 아니다: 표시를 남기지 않고, 다음 조회도 보낸다."""
+        self.reply = "<response><header><resultCode>30</resultCode><resultMsg>SERVICE KEY IS NOT REGISTERED ERROR</resultMsg></header></response>"
+        text = kipris._send("path", {})
+        self.assertFalse((self.guard / "BLOCKED").exists())
+        self.assertEqual(list(self.guard.glob("KEYERR_*")) if self.guard.exists() else [], [])
+        with self.assertRaises(kipris.KiprisError):
+            kipris.parse_root(text)
+        kipris._send("path", {})
+        self.assertEqual(len(self.sent), 2)
+
+    def test_old_block_marker_for_code_30_is_ignored(self):
+        self.guard.mkdir(parents=True)
+        for why in ("KIPRIS Plus 키가 맞지 않거나 이 상품을 신청하지 않았습니다 (결과 코드 30: 등록된 서비스키를 입력해 주십시오"
+                    "(Access key & Service key is not registerd error)).", "SERVICE_KEY_IS_NOT_REGISTERED_ERROR"):
+            (self.guard / "BLOCKED").write_text("2026-11-01 06:54:06\n%s\n" % why, encoding="utf-8")
+            kipris._send("path", {})
+        self.assertTrue((self.guard / "BLOCKED").exists())              # 지우지 않는다
+        self.assertEqual(len(self.sent), 2)
 
     def test_other_codes_do_not_block(self):
         self.reply = "<response><header><resultCode>00</resultCode></header></response>"

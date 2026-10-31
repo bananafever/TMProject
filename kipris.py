@@ -9,7 +9,8 @@ CPProject(ChekPat)의 `app/modules/patent/kipris_client.py`·`kipris_case.py` �
   ① 이 PC 셈 `kipris_ledger.json`(키·달마다, 파일 잠금 안에서 — settings.json 의 `kipris_calls` 는 더 쓰지 않는다)
   ② NAS `iplog.kipris_usage`(키의 SHA-256 앞 16자 × 달)와 발신자 표 `kipris_usage_src` 로 정산 — 미보고분은 조건 없이,
   새 호출 1회만 정산 뒤 값이 상한 미만일 때 ③ 모든 전송이 `~/.chekpat/kipris_bulk/gate` 속도 문턱(초당 40)을 거친다
-  ④ `BLOCKED` 표시가 있으면 보내지 않고, 응답 결과 코드 20(접근 거부)이면 남긴다(지우는 것은 ChekPat).
+  ④ `BLOCKED` 표시가 있으면 보내지 않고, 응답 결과 코드 20(접근 거부)이면 남긴다(지우는 것은 ChekPat). 결과 코드 30(키·상품
+  미등록)은 막힘이 아니다 — 표시를 남기지 않고, 예전 판이 30 으로 남긴 `BLOCKED` 도 무시한다(규약 6절).
   이 앱의 상한은 950 이다(ChekPat 900) — 이 앱의 호출은 한 달 몇 번뿐인데 빠지면 일정이 틀린다. ChekPat 이 900 을 다 쓴 달
   (10-28)에 재심사 여부를 못 받은 일이 있어, ChekPat 이 멈춘 뒤에도 이 앱은 50회를 더 쓴다(10-29).
 - 응답 필드: `Mailingnumber`(발송번호)·`DocNm`(서류명)·`ExpirationDuedateDate`(연장 반영 마감기한).
@@ -232,9 +233,15 @@ def _mark_blocked(reason: str) -> None:
         logging.error(f"KIPRIS 막힘 표시를 남기지 못했습니다: {e}")
 
 
+def _is_key_error(reason: str) -> bool:
+    """막힘 표시의 까닭이 키·상품 미등록(결과 코드 30)인가 — 예전 판은 이것도 `BLOCKED` 로 적었다(규약 6절)."""
+    return bool(re.search(r"결과 코드 30\b|SERVICE[\s_]*KEY[\s_]*IS[\s_]*NOT[\s_]*REGISTER|not registerd", reason or "", re.I))
+
+
 def _check_not_blocked() -> None:
+    """속도·IP 차단(결과 코드 20)의 `BLOCKED` 만 막는다. 키·상품 미등록(30)은 막힘이 아니라 — 예전 판이 남긴 것도 무시한다."""
     reason = blocked_reason()
-    if reason is not None:
+    if reason is not None and not _is_key_error(reason):
         why = reason.split("\n", 1)[-1].strip() or reason
         raise KiprisError(f"KIPRIS 호출이 막혀 있어 보내지 않습니다 ({why}). 지우려면 ChekPat 연결 설정에서 KIPRIS 상품을 점검하세요.")
 
@@ -285,31 +292,24 @@ class _Ledger:
         return self.data["entries"]
 
     def load(self, kid: str) -> None:
-        path = _ledger_path()
-        data = None
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(_ledger_path(), encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
-                raise ValueError("형식")
         except FileNotFoundError:
             data = None
         except (OSError, ValueError):
-            try:
-                os.replace(path, path.with_name(path.name + ".bad"))      # 못 읽는 파일은 치워 두고 새로
-            except OSError:
-                pass
-            data = None
-        fresh = data is None
-        if fresh:
-            data = {"version": 1, "src": "", "entries": {}}
-        if not re.fullmatch(r"[0-9a-f]{16}", str(data.get("src") or "")):
-            data["src"] = secrets.token_hex(8)
-        self.data = data
-        if fresh:
+            data = {}                                   # 깨진 파일 — 새로(발신자 번호도 새로, 옛 settings.json 은 다시 옮기지 않는다)
+        if data is not None and not isinstance(data, dict):
+            data = {}
+        if data is None:                                # 처음 — settings.json 의 옛 셈을 지금 키로 옮긴다
+            data = {"version": 1, "src": secrets.token_hex(8), "entries": {}}
             if kid:
-                _migrate_settings(self.entries, kid)
-            self.save()
+                _migrate_settings(data["entries"], kid)
+        elif not isinstance(data.get("src"), str) or not data.get("src"):
+            data = {"version": 1, "src": secrets.token_hex(8), "entries": dict(data.get("entries") or {})}
+        if not isinstance(data.get("entries"), dict):
+            data["entries"] = {}
+        self.data = data
 
     def save(self) -> None:
         path = _ledger_path()
@@ -342,18 +342,29 @@ class _Ledger:
         """미보고분이 없고 가득 차지도 않은, 석 달 넘게 지난 항목만 지운다."""
         now = _month_index(this_month)
         for k in [k for k, e in self.entries.items()
-                  if int(e.get("calls", 0)) <= int(e.get("reported", 0)) and not e.get("full")
+                  if "|" in k and isinstance(e, dict)
+                  and int(e.get("calls", 0)) <= int(e.get("reported", 0)) and not e.get("full")
                   and now - _month_index(k.split("|", 1)[1]) >= 3]:
             del self.entries[k]
 
 
 @contextlib.contextmanager
-def _ledger(kid: str):
+def _ledger(kid: str, month: str):
+    """잠금을 쥐고 셈을 연다. 나갈 때(예외로 나가도) 오래된 다 올린 항목을 지우고, 바뀐 것이 있으면 저장한다."""
     with _count_lock:                                  # 같은 프로세스의 스레드 — 파일 잠금보다 먼저
         with _locked_file(_chekpat_dir() / "kipris_ledger.lock"):
             led = _Ledger()
+            try:
+                text = (_ledger_path()).read_text(encoding="utf-8")
+            except OSError:
+                text = None
             led.load(kid)
-            yield led
+            try:
+                yield led
+            finally:
+                led.prune(month)
+                if text is None or json.dumps(led.data, ensure_ascii=False, indent=1) != text:
+                    led.save()
 
 
 # NAS 정산 (규약 4절)
@@ -455,11 +466,12 @@ def _count_call(today: Optional[date] = None) -> None:
         return                                      # 키가 없으면 보내지 않는다 — _send 가 먼저 막는다
     kid, month = key_id(key), (today or date.today()).strftime("%Y-%m")
     cur_key = f"{kid}|{month}"
-    with _ledger(kid) as led:
+    with _ledger(kid, month) as led:
         offline = False
         stale = sorted((k for k, e in led.entries.items()
-                        if k != cur_key and (int(e.get("calls", 0)) > int(e.get("reported", 0)) or e.get("full"))),
-                       key=lambda k: k.split("|", 1)[1])
+                        if "|" in k and isinstance(e, dict) and k != cur_key
+                        and (int(e.get("calls", 0)) > int(e.get("reported", 0)) or e.get("full"))),
+                       key=lambda k: tuple(reversed(k.split("|", 1))))     # 오래된 달부터 (달, 키 id)
         for k in stale:
             k_id, ym = k.split("|", 1)
             e = led.entry(k_id, ym)
@@ -481,7 +493,6 @@ def _count_call(today: Optional[date] = None) -> None:
                 if grant:
                     ent["calls"] += 1
                     ent["reported"] = ent["calls"]
-                led.prune(month)
                 led.save()
                 if not grant:
                     raise KiprisError("이번 달 KIPRIS 호출이 상한에 닿았습니다 (%d/%d)." % (total, MONTHLY_CAP))
