@@ -599,9 +599,10 @@ def handle_prenotice(message):
     단 의견제출통지서인데 마감기한을, 거절결정서인데 재심사 여부를 아직 못 받은 행은 다시 조회합니다.
     반환값: 새로 저장(또는 갱신)한 행 수
     """
-    rows = parse_prenotice_rows(message.Body, config["prenotice_assignee"])
+    assignee = config.get("prenotice_assignee", "신용석")
+    rows = parse_prenotice_rows(message.Body, assignee)
     if not rows:
-        logging.info(f"예고 메일에서 담당자 행을 찾지 못했습니다: {message.Subject}")
+        logging.info(f"예고 메일 ({assignee} 담당 사건 없음, 건너뜀): {message.Subject}")
         return 0
 
     cache = load_case_cache()
@@ -1176,15 +1177,19 @@ class ScheduleDialog(qtw.QDialog):
             layout.addWidget(group)
 
         btn_box = qtw.QHBoxLayout()
+        btn_box.setSpacing(8)
         btn_box.addStretch()
         self.btn_retry = qtw.QPushButton("다시 시도")
+        self.btn_retry.setObjectName("cancelButton")
         self.btn_retry.clicked.connect(self._on_retry)
         self.btn_register = qtw.QPushButton("등록")
+        self.btn_register.setObjectName("dialogPrimaryButton")
         self.btn_register.clicked.connect(self._on_register)
         self.btn_cancel = qtw.QPushButton("취소")
-        self.btn_cancel.setObjectName("quitButton")
+        self.btn_cancel.setObjectName("cancelButton")
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_close = qtw.QPushButton("닫기")
+        self.btn_close.setObjectName("dialogPrimaryButton")
         self.btn_close.clicked.connect(self.accept)
         for btn in (self.btn_retry, self.btn_register, self.btn_cancel, self.btn_close):
             btn_box.addWidget(btn)
@@ -1480,6 +1485,7 @@ class StartupSummaryDialog(qtw.QDialog):
             note.setStyleSheet("color: #8A5300;")
             layout.addWidget(note)
         close_btn = qtw.QPushButton("닫기")
+        close_btn.setObjectName("dialogPrimaryButton")
         close_btn.clicked.connect(self.accept)
         btn_box = qtw.QHBoxLayout()
         btn_box.addStretch()
@@ -1518,12 +1524,14 @@ class FieldsDialog(qtw.QDialog):
             hint.setWordWrap(True)
             layout.addWidget(hint)
         btn_box = qtw.QHBoxLayout()
+        btn_box.setSpacing(8)
         btn_box.addStretch()
         ok_btn = qtw.QPushButton("확인")
+        ok_btn.setObjectName("dialogPrimaryButton")
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.accept)
         cancel_btn = qtw.QPushButton("취소")
-        cancel_btn.setObjectName("quitButton")
+        cancel_btn.setObjectName("cancelButton")
         cancel_btn.clicked.connect(self.reject)
         btn_box.addWidget(ok_btn)
         btn_box.addWidget(cancel_btn)
@@ -2216,12 +2224,13 @@ class MainWin(qtw.QWidget):
         win_layout.setSpacing(0)
         win_layout.addLayout(content_row, 1)
 
-        # 하단 영역: 상단과 구분선을 둔 일체형 풋터 바 (안 2: macOS 소프트 필 스타일)
+        # 하단 영역: 상단과 구분선을 둔 일체형 풋터 바 (macOS 스타일)
         bottom_bar = qtw.QFrame()
         bottom_bar.setObjectName("bottomBar")
+        bottom_bar.setFixedHeight(50)
         quit_row = qtw.QHBoxLayout(bottom_bar)
-        quit_row.setContentsMargins(18, 10, 18, 12)
-        quit_row.setSpacing(10)
+        quit_row.setContentsMargins(18, 11, 18, 13)
+        quit_row.setSpacing(8)
         # Settings 탭에서만: 안내 + 「설정 저장」 (Quit 과 같은 크기)
         self.save_hint = qtw.QLabel("변경 사항은 저장해야 적용됩니다")
         self.save_hint.setObjectName("settingsHint")
@@ -2548,11 +2557,9 @@ class MainWin(qtw.QWidget):
         self.graph_status.setStyleSheet("" if ok is None else ("color: #1E6B3A;" if ok else "color: #C0392B;"))
 
     def _equalize_bottom_buttons(self):
-        """「설정 저장」 과 Quit 을 같은 폭·높이로 — 둘 중 큰 쪽에 맞춘다."""
-        for btn in self.bottom_buttons:
-            btn.ensurePolished()
-        width = max([110] + [b.sizeHint().width() for b in self.bottom_buttons])
-        height = max([36] + [b.sizeHint().height() for b in self.bottom_buttons])
+        """「설정 저장」 과 Quit 을 같은 폭·높이로 맞춘다."""
+        width = 76
+        height = 28
         for btn in self.bottom_buttons:
             btn.setFixedSize(width, height)
 
@@ -2927,6 +2934,36 @@ if __name__ == "__main__":
         #searchFilterContainer QLabel {
             background-color: transparent;
         }
+        QPushButton[class="filterChip"], QPushButton#filterChip {
+            background-color: white;
+            color: #475569;
+            border: 1px solid #DCE3DF;
+            border-radius: 8px;
+            padding: 4px 10px;
+            font-size: 9.5pt;
+            font-weight: 500;
+            min-height: 22px;
+        }
+        QPushButton[class="filterChip"]:hover, QPushButton#filterChip:hover {
+            border: 1px solid #9FC9BF;
+            background-color: #F8FAF9;
+            color: #26695E;
+        }
+        QPushButton[class="filterChip"]:checked, QPushButton#filterChip:checked {
+            background-color: #E1F5EE;
+            border: 1px solid #26695E;
+            color: #085041;
+            font-weight: 600;
+        }
+        QPushButton[class="filterChip"]:checked:hover, QPushButton#filterChip:checked:hover {
+            background-color: #D3EFE5;
+            border: 1px solid #1E554C;
+        }
+        QPushButton[class="filterChip"]:disabled, QPushButton#filterChip:disabled {
+            background-color: #F8FAFC;
+            color: #94A3B8;
+            border-color: #E2E8F0;
+        }
         #searchStatus {
             color: #64748B;
             font-size: 9pt;
@@ -3036,35 +3073,88 @@ if __name__ == "__main__":
             border: none;
             border-top: 1px solid #DCE3DF;
         }
-        #quitButton {
+        /* 다이얼로그 캡슐 스타일 */
+        QDialog QPushButton {
+            min-height: 36px;
+            min-width: 44px;
+            border-radius: 18px;
+            font-size: 10pt;
+            padding: 0 18px;
+        }
+        #cancelButton,
+        QPushButton#dialogSecondaryButton {
             background-color: #ECEAE5;
             color: #52525B;
             border: none;
             border-radius: 18px;
             font-weight: 500;
-            padding: 0 16px;
+            min-height: 36px;
+            min-width: 44px;
+            padding: 0 18px;
         }
-        #quitButton:hover {
+        #cancelButton:hover,
+        QPushButton#dialogSecondaryButton:hover {
             background-color: #DFDDD7;
             color: #18181B;
         }
-        #quitButton:pressed {
+        #cancelButton:pressed,
+        QPushButton#dialogSecondaryButton:pressed {
             background-color: #D4D1C9;
             color: #18181B;
         }
-        QPushButton#saveButton {
+        QPushButton#dialogPrimaryButton {
             background-color: #26695E;
             color: white;
             border: none;
             border-radius: 18px;
             font-weight: bold;
-            padding: 0 16px;
+            min-height: 36px;
+            min-width: 44px;
+            padding: 0 18px;
+        }
+        QPushButton#dialogPrimaryButton:hover {
+            background-color: #2F7C6E;
+        }
+        QPushButton#dialogPrimaryButton:pressed {
+            background-color: #1B4B43;
+        }
+        /* 하단 바 버튼 (Option 2: macOS 시스템 블루 & 콤팩트 모던 라운드) */
+        #quitButton {
+            background-color: #F3F4F6;
+            color: #4B5563;
+            border: 1px solid #D1D5DB;
+            border-radius: 6px;
+            font-size: 10pt;
+            font-weight: 500;
+            min-height: 0px;
+            min-width: 0px;
+            padding: 0 10px;
+        }
+        #quitButton:hover {
+            background-color: #E5E7EB;
+            color: #1F2937;
+            border: 1px solid #9CA3AF;
+        }
+        #quitButton:pressed {
+            background-color: #D1D5DB;
+            color: #111827;
+        }
+        QPushButton#saveButton {
+            background-color: #007AFF;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 10pt;
+            font-weight: bold;
+            min-height: 0px;
+            min-width: 0px;
+            padding: 0 10px;
         }
         QPushButton#saveButton:hover {
-            background-color: #1F574E;
+            background-color: #0066D6;
         }
         QPushButton#saveButton:pressed {
-            background-color: #17423B;
+            background-color: #0055B8;
         }
     """.replace("{arrow_icon}", arrow_icon)
        .replace("{arrow_hover_icon}", arrow_hover_icon)
