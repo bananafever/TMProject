@@ -279,6 +279,14 @@ def create_dir_if_not_exists(directory):
         return False
 
 
+def make_writable(path):
+    """기존 권한은 두고 소유자 쓰기 권한만 더한다(폴더는 읽기·진입도).
+    os.chmod(path, stat.S_IWRITE) 는 맥·리눅스에서 모드를 0200 으로 덮어써 폴더를 못 열게 만든다."""
+    mode = os.stat(path).st_mode
+    add = stat.S_IWUSR | (stat.S_IRUSR | stat.S_IXUSR if stat.S_ISDIR(mode) else 0)
+    os.chmod(path, mode | add)
+
+
 def safe_remove_path(path, retries=5, delay=0.1):
     """파일 또는 디렉토리의 읽기 전용 속성을 해제하고 재시도 로직을 포함하여 안전하게 삭제합니다."""
     if not os.path.exists(path):
@@ -286,26 +294,26 @@ def safe_remove_path(path, retries=5, delay=0.1):
 
     def _remove_readonly(func, p, exc_info):
         try:
-            os.chmod(p, stat.S_IWRITE)
+            make_writable(p)
             func(p)
         except Exception:
             pass
 
     for i in range(retries):
         try:
-            os.chmod(path, stat.S_IWRITE)
+            make_writable(path)
             if os.path.isdir(path):
                 for root, dirs, files in os.walk(path, topdown=False):
                     for name in files:
                         fp = os.path.join(root, name)
                         try:
-                            os.chmod(fp, stat.S_IWRITE)
+                            make_writable(fp)
                         except Exception:
                             pass
                     for name in dirs:
                         dp = os.path.join(root, name)
                         try:
-                            os.chmod(dp, stat.S_IWRITE)
+                            make_writable(dp)
                         except Exception:
                             pass
                 shutil.rmtree(path, onerror=_remove_readonly)
@@ -2643,13 +2651,13 @@ class MainWin(qtw.QWidget):
                         dst_file_path = os.path.join(dest_dir, file_name)
                         try:
                             if os.path.exists(file_path):
-                                os.chmod(file_path, stat.S_IWRITE)
+                                make_writable(file_path)
                             if os.path.exists(dst_file_path):
                                 if os.path.isdir(dst_file_path):
                                     shutil.copytree(file_path, dst_file_path, dirs_exist_ok=True)
                                     safe_remove_path(file_path)
                                 else:
-                                    os.chmod(dst_file_path, stat.S_IWRITE)
+                                    make_writable(dst_file_path)
                                     os.replace(file_path, dst_file_path)
                             else:
                                 shutil.move(file_path, dest_dir)
