@@ -49,12 +49,22 @@ def find_mac_gdrive_data_dir() -> str | None:
     return None
 
 
+def find_mac_dropbox_data_dir() -> str | None:
+    cand = os.path.expanduser("~/Library/CloudStorage/Dropbox/5_APPS/TaskManager")
+    return cand if os.path.isdir(cand) else None
+
+
+DROPBOX_DATA_DIR = r"C:/Dropbox/5_APPS/TaskManager"
+LEGACY_GDRIVE_DATA_DIR = r"G:/내 드라이브/bananafever/5_APPS/TaskManager"   # Dropbox 로 옮기기 전 자리 — 폴백
+
+
 def default_data_dir() -> str:
+    """Dropbox 의 5_APPS/TaskManager 가 있으면 그것, 없으면 예전 구글 드라이브 자리, 둘 다 없으면 Dropbox 기본 문자열."""
     if sys.platform == "darwin":
-        mac_g = find_mac_gdrive_data_dir()
-        if mac_g:
-            return mac_g
-    return r"G:/내 드라이브/bananafever/5_APPS/TaskManager"
+        return find_mac_dropbox_data_dir() or find_mac_gdrive_data_dir() or DROPBOX_DATA_DIR
+    if not os.path.isdir(DROPBOX_DATA_DIR) and os.path.isdir(LEGACY_GDRIVE_DATA_DIR):
+        return LEGACY_GDRIVE_DATA_DIR
+    return DROPBOX_DATA_DIR
 
 
 DEFAULT_DATA_DIR = default_data_dir()
@@ -125,7 +135,7 @@ name_key = re.compile(r"; [ㄱ-ㅎ|ㅏ-ㅣ|가-힣]+(?=\()")
 CONFIG_FILE = data_path("settings.json")
 DEFAULT_CONFIG = {
     "parent_path": r"C:/Dropbox/1_Project/Tasks",
-    "target_path": r"G:/내 드라이브/bananafever/4_Archives/01_Work/02_Review",
+    "target_path": r"C:/Dropbox/4_Archives/01_Work/02_Review",
     "prenotice_assignee": "신용석",  # 예고 메일 표에서 읽을 담당자
     # 위임 메일 일정을 등록할 네이버 캘린더 이름 (계정: python naver_cal.py --setup)
     "naver_calendars": {"Mail": "Mail", "No_Instructions": "No_Instructions"},

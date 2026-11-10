@@ -712,6 +712,29 @@ class TestApplicant(unittest.TestCase):
                 self.assertEqual(main.data_dir(), os.path.dirname(os.path.abspath(main.__file__)))
         self.assertEqual(main.DATA_DIR, os.environ["TASKMANAGER_DATA_DIR"])  # 테스트는 임시 폴더
 
+    def test_default_data_dir_prefers_dropbox_then_google(self):
+        with tempfile.TemporaryDirectory() as home:
+            cloud = os.path.join(home, "Library", "CloudStorage")
+            dropbox = os.path.join(cloud, "Dropbox", "5_APPS", "TaskManager")
+            google = os.path.join(cloud, "GoogleDrive-x@y.z", "내 드라이브", "bananafever", "5_APPS", "TaskManager")
+            with patch.dict(os.environ, {"HOME": home}), patch.object(sys, "platform", "darwin"):
+                self.assertEqual(main.default_data_dir(), main.DROPBOX_DATA_DIR)     # 둘 다 없다
+                os.makedirs(google)
+                self.assertEqual(main.default_data_dir(), google)                    # 구글만
+                os.makedirs(dropbox)
+                self.assertEqual(main.default_data_dir(), dropbox)                   # 둘 다 있으면 Dropbox 먼저
+
+    def test_default_data_dir_windows_fallback(self):
+        real = os.path.isdir
+        with patch.object(sys, "platform", "win32"):
+            with patch.object(os.path, "isdir", lambda p: p == main.LEGACY_GDRIVE_DATA_DIR or real(p)):
+                self.assertEqual(main.default_data_dir(), main.LEGACY_GDRIVE_DATA_DIR)
+            with patch.object(os.path, "isdir", lambda p: p in (main.DROPBOX_DATA_DIR, main.LEGACY_GDRIVE_DATA_DIR)):
+                self.assertEqual(main.default_data_dir(), main.DROPBOX_DATA_DIR)
+            with patch.object(os.path, "isdir", lambda p: False):
+                self.assertEqual(main.default_data_dir(), main.DROPBOX_DATA_DIR)
+        self.assertEqual(main.DEFAULT_CONFIG["target_path"], "C:/Dropbox/4_Archives/01_Work/02_Review")
+
     def test_parse_names(self):
         self.assertEqual(main.parse_names(" 이여름 ,한송희,, 이여름 "), ["이여름", "한송희"])
         self.assertEqual(main.parse_names(""), [])
