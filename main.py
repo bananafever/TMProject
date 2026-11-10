@@ -2654,8 +2654,15 @@ class MainWin(qtw.QWidget):
                     create_dir_if_not_exists(dest_dir)
 
                     failed = False
-                    files_in_origin = os.listdir(origin_path)
-                    
+                    try:
+                        # 예전 버그로 0200(쓰기 전용)이 된 폴더도 열 수 있게 먼저 권한을 되살린다
+                        make_writable(origin_path)
+                        files_in_origin = os.listdir(origin_path)
+                    except Exception as e:
+                        logging.error(f"작업 폴더 열기 실패 ({origin_path}): {e}")
+                        completion_messages.append((date_folder, label_ref, label_name, "이전 실패(폴더 열기 오류)"))
+                        continue
+
                     for file_name in files_in_origin:
                         file_path = os.path.join(origin_path, file_name)
                         dst_file_path = os.path.join(dest_dir, file_name)
